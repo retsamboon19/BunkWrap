@@ -729,6 +729,25 @@
     color: var(--text); background: rgba(255,255,255,0.05);
     border-left-color: rgba(0,229,255,0.3);
   }
+  /* Task 3.1, 8.5: Multi-selected album styles with focus indicators */
+  .sidebar-album.multi-selected {
+    color: var(--accent); background: rgba(0,229,255,0.15);
+    border-left: 2px solid var(--accent);
+  }
+  .sidebar-album.multi-selected:hover {
+    background: rgba(0,229,255,0.20);
+  }
+  /* Task 8.5: Focus indicator for keyboard navigation */
+  /* Requirements 3.2.2: Add focus indicators for selected albums */
+  .sidebar-album:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .sidebar-album.multi-selected:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.2);
+  }
   .sidebar-album.drag-over { background: rgba(0,229,255,0.12); color: var(--accent); }
   .sidebar-album.dragging-album { opacity: 0.4; }
   .sidebar-album.nested {
@@ -771,6 +790,22 @@
   .sidebar-empty {
     padding: 24px 14px; font-family: var(--mono); font-size: 0.6rem;
     color: var(--muted); letter-spacing: 1px; line-height: 2;
+  }
+
+  /* Task 3.3: Album selection count indicator */
+  .album-selection-count {
+    position: fixed;
+    bottom: 18px;
+    left: 14px;
+    z-index: 9999;
+    padding: 5px 12px;
+    font-family: var(--mono); font-size: 0.62rem;
+    color: var(--accent); letter-spacing: 1px;
+    background: rgba(10,30,35,0.92);
+    border: 1px solid rgba(0,229,255,0.35);
+    border-radius: 12px;
+    pointer-events: none;
+    display: none;
   }
 
   /* ── Gallery content panel ── */
@@ -1470,6 +1505,7 @@
   .context-menu-item.disabled {
     opacity: 0.4;
     cursor: not-allowed;
+    pointer-events: none;
   }
   .context-menu-item .icon {
     width: 14px;
@@ -1495,6 +1531,106 @@
   }
   .album-context-menu.visible {
     display: block;
+  }
+  
+  /* Task 8.2: Loading overlay for batch operations */
+  /* Requirements 2.5.3, 3.1.2: Show progress during batch operations */
+  .batch-operation-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    z-index: 20000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .batch-operation-overlay.visible {
+    display: flex;
+  }
+  .batch-operation-spinner {
+    width: 60px;
+    height: 60px;
+    border: 4px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  .batch-operation-message {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--text);
+    letter-spacing: 1px;
+    text-align: center;
+    max-width: 500px;
+    line-height: 1.6;
+  }
+  .batch-operation-progress {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--accent);
+    letter-spacing: 1px;
+  }
+  
+  /* Task 8.2: Success/Error message toast */
+  .batch-operation-toast {
+    position: fixed;
+    top: 80px;
+    right: 20px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 16px 20px;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    z-index: 20001;
+    display: none;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+    max-width: 400px;
+    animation: slideIn 0.3s ease;
+  }
+  .batch-operation-toast.visible {
+    display: block;
+  }
+  .batch-operation-toast.success {
+    border-color: var(--ok);
+    background: rgba(34, 197, 94, 0.1);
+    color: var(--ok);
+  }
+  .batch-operation-toast.error {
+    border-color: var(--err);
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--err);
+  }
+  .batch-operation-toast-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 1rem;
+    opacity: 0.6;
+    line-height: 1;
+  }
+  .batch-operation-toast-close:hover {
+    opacity: 1;
+  }
+  @keyframes slideIn {
+    from {
+      transform: translateX(100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
   }
 </style>
 </head>
@@ -1569,7 +1705,7 @@
       </div>
       <div class="setting-group">
         <div class="setting-label">VIDEO/ZIP THREADS <span class="range-val" id="vidThreadsVal">2</span></div>
-        <input type="range" id="vidThreads" min="1" max="15" value="2"
+        <input type="range" id="vidThreads" min="1" max="10" value="2"
           oninput="onVidThreadsChange(this.value)">
       </div>
       <div class="setting-group">
@@ -1582,10 +1718,17 @@
         <input type="range" id="soundVolume" min="0" max="100" value="25"
           oninput="setSoundVolume(this.value)">
       </div>
-      <div id="poolSection" style="border-top:1px solid var(--border);padding-top:12px;">
-        <label>BROWSER POOL</label>
-        <div class="pool-dots" id="poolDots" style="margin-top:8px;"></div>
-        <div class="pool-status-text" id="poolStatusText"></div>
+      <div id="poolSection" style="border-top:1px solid var(--border);padding-top:12px;display:flex;flex-direction:column;gap:10px;">
+        <div>
+          <label>IMAGE THREADS</label>
+          <div class="pool-dots" id="imgPoolDots" style="margin-top:8px;"></div>
+          <div class="pool-status-text" id="imgPoolStatusText"></div>
+        </div>
+        <div>
+          <label>VIDEO/ZIP POOL</label>
+          <div class="pool-dots" id="poolDots" style="margin-top:8px;"></div>
+          <div class="pool-status-text" id="poolStatusText"></div>
+        </div>
       </div>
       <div style="border-top:1px solid var(--border);padding-top:12px;">
         <button class="btn" onclick="generateAllThumbnails()" style="width:100%;margin-bottom:12px;">🖼 GENERATE THUMBNAILS</button>
@@ -1783,6 +1926,8 @@
 // ──────────────────────────────────────────────────────────────────────────────
 let activeJobId = null;
 let pollTimer = null;
+let albumMtimeLast = null;
+let albumMtimeTimer = null;
 let allGalleryItems = [];
 let currentFilter = 'all';
 let currentSort = 'name-asc';
@@ -1809,6 +1954,10 @@ const doneJobIds = new Set();
 
 // Detect stalled progress (same done count for a long time while running)
 let jobProgressWatch = {};
+
+// Log delta tracking: only fetch new entries each poll
+const logOffset = {};      // jobId → next log index to request from server
+const accumulatedLog = {}; // jobId → full accumulated log array
 
 // URL input debounce
 let urlDebounce = null;
@@ -1947,6 +2096,187 @@ const undoManager = {
         undoBtn.style.display = 'none';
       }
     }
+  }
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Album Selection Manager Module
+// Task 1.1: Core album multi-selection state management
+// Requirements 2.1.1, 2.1.2, 2.1.3, 2.1.4, 2.1.5
+// ──────────────────────────────────────────────────────────────────────────────
+const albumSelectionManager = {
+  // State storage using Set for O(1) lookups
+  selectedAlbums: new Set(),
+  
+  // Last clicked album for shift-click range selection
+  lastClickedAlbum: null,
+  
+  // Drag selection state
+  dragStartAlbum: null,
+  dragCurrentAlbum: null,
+  isDragging: false,
+  
+  /**
+   * Task 1.1: Select a single album
+   * Requirements 2.1.1: Single album selection
+   * @param {string} albumName - Album name to select
+   */
+  selectAlbum(albumName) {
+    this.selectedAlbums.add(albumName);
+  },
+  
+  /**
+   * Task 1.1: Deselect an album
+   * @param {string} albumName - Album name to deselect
+   */
+  deselectAlbum(albumName) {
+    this.selectedAlbums.delete(albumName);
+  },
+  
+  /**
+   * Task 1.1: Toggle album selection state
+   * Requirements 2.1.2: Multi-album selection with Ctrl/Cmd
+   * @param {string} albumName - Album name to toggle
+   */
+  toggleAlbum(albumName) {
+    if (this.selectedAlbums.has(albumName)) {
+      this.selectedAlbums.delete(albumName);
+    } else {
+      this.selectedAlbums.add(albumName);
+    }
+  },
+  
+  /**
+   * Task 1.1: Clear all album selections
+   * Requirements 2.1.5: Selection clearing
+   */
+  clearSelection() {
+    this.selectedAlbums.clear();
+    this.lastClickedAlbum = null;
+  },
+  
+  /**
+   * Task 1.1: Check if an album is selected
+   * @param {string} albumName - Album name to check
+   * @returns {boolean} True if album is selected
+   */
+  isSelected(albumName) {
+    return this.selectedAlbums.has(albumName);
+  },
+  
+  /**
+   * Task 1.1: Get all selected albums
+   * @returns {Array<string>} Array of selected album names
+   */
+  getSelectedAlbums() {
+    return Array.from(this.selectedAlbums);
+  },
+  
+  /**
+   * Task 1.1: Get count of selected albums
+   * @returns {number} Number of selected albums
+   */
+  getSelectionCount() {
+    return this.selectedAlbums.size;
+  },
+  
+  /**
+   * Task 1.1: Set last clicked album for shift-click tracking
+   * Requirements 2.1.3: Range selection with Shift-click
+   * @param {string} albumName - Album name that was last clicked
+   */
+  setLastClickedAlbum(albumName) {
+    this.lastClickedAlbum = albumName;
+  },
+  
+  /**
+   * Task 1.1: Get last clicked album
+   * @returns {string|null} Last clicked album name or null
+   */
+  getLastClickedAlbum() {
+    return this.lastClickedAlbum;
+  },
+  
+  /**
+   * Task 1.2: Select range of albums between start and end
+   * Requirements 2.1.3: Range selection with Shift-click
+   * @param {string} startAlbum - Start album name
+   * @param {string} endAlbum - End album name
+   */
+  selectRange(startAlbum, endAlbum) {
+    // Get all album elements in DOM order
+    const allAlbumElements = Array.from(
+      document.querySelectorAll('.sidebar-album')
+    );
+    
+    // Find indices of start and end albums
+    let startIndex = -1;
+    let endIndex = -1;
+    
+    for (let i = 0; i < allAlbumElements.length; i++) {
+      const albumName = allAlbumElements[i].dataset.album;
+      if (albumName === startAlbum) startIndex = i;
+      if (albumName === endAlbum) endIndex = i;
+    }
+    
+    // Ensure valid indices
+    if (startIndex === -1 || endIndex === -1) return;
+    
+    // Normalize range (handle reverse selection)
+    const rangeStart = Math.min(startIndex, endIndex);
+    const rangeEnd = Math.max(startIndex, endIndex);
+    
+    // Select all albums in range
+    for (let i = rangeStart; i <= rangeEnd; i++) {
+      const albumName = allAlbumElements[i].dataset.album;
+      this.selectedAlbums.add(albumName);
+    }
+  },
+  
+  /**
+   * Task 1.3: Start drag selection
+   * Requirements 2.1.4: Drag-to-select
+   * @param {string} startAlbum - Album where drag started
+   */
+  startDragSelection(startAlbum) {
+    this.dragStartAlbum = startAlbum;
+    this.dragCurrentAlbum = startAlbum;
+    this.isDragging = false; // Will be set to true after threshold
+  },
+  
+  /**
+   * Task 1.3: Update drag selection to current album
+   * Requirements 2.1.4: Drag-to-select
+   * @param {string} currentAlbum - Album currently being hovered
+   */
+  updateDragSelection(currentAlbum) {
+    if (!this.dragStartAlbum) return;
+    
+    this.dragCurrentAlbum = currentAlbum;
+    this.isDragging = true;
+    
+    // Clear current selection and select range
+    this.selectedAlbums.clear();
+    this.selectRange(this.dragStartAlbum, currentAlbum);
+  },
+  
+  /**
+   * Task 1.3: End drag selection
+   * Requirements 2.1.4: Drag-to-select
+   */
+  endDragSelection() {
+    this.dragStartAlbum = null;
+    this.dragCurrentAlbum = null;
+    this.isDragging = false;
+  },
+  
+  /**
+   * Task 1.1: Select all albums
+   * @param {Array<string>} albumNames - Array of all album names
+   */
+  selectAll(albumNames) {
+    this.selectedAlbums.clear();
+    albumNames.forEach(name => this.selectedAlbums.add(name));
   }
 };
 
@@ -2757,7 +3087,13 @@ async function init() {
   // Album context menu event handlers (sidebar right-click)
   setupAlbumContextMenuHandlers();
   
-  loadGallery();
+  // Task 2.4: Attach album multi-select event listeners
+  attachAlbumSelectionListeners();
+
+  // Rubber-band drag selection for the album sidebar
+  setupAlbumSelectionBoxHandlers();
+  
+  loadGallery().then(() => { startAlbumChangePoller(); });
   updateDisk();
   setInterval(updateDisk, 10000);
   updatePoolDots();
@@ -2785,7 +3121,21 @@ async function init() {
   } catch(e) {}
 }
 
+function updateImgDots() {
+  const count  = parseInt(document.getElementById('imgThreads')?.value) || 0;
+  const dotsEl = document.getElementById('imgPoolDots');
+  const textEl = document.getElementById('imgPoolStatusText');
+  if (!dotsEl) return;
+  const html = [];
+  for (let i = 0; i < count; i++) {
+    html.push(`<div class="pool-dot ready" title="Image slot ${i+1}: ready"></div>`);
+  }
+  dotsEl.innerHTML = html.join('');
+  if (textEl) textEl.textContent = count > 0 ? `${count} slot${count !== 1 ? 's' : ''}` : '';
+}
+
 async function updatePoolDots() {
+  updateImgDots();
   try {
     const d = await fetch('/api/pool/size').then(r => r.json());
     const target  = d.target  || 0;
@@ -2798,7 +3148,8 @@ async function updatePoolDots() {
     const textEl  = document.getElementById('poolStatusText');
     if (!dotsEl) return;
     if (target === 0) {
-      if (section) section.style.display = 'none';
+      if (dotsEl) dotsEl.innerHTML = '';
+      if (textEl) textEl.textContent = 'unavailable';
       return;
     }
     if (section) section.style.display = '';
@@ -2825,7 +3176,7 @@ let _poolDebounce = null;
 function onImgThreadsChange(val) {
   val = parseInt(val);
   document.getElementById('imgThreadsVal').textContent = val;
-  // Browser pool scales with video threads, not image threads
+  updateImgDots();
 }
 
 function onVidThreadsChange(val) {
@@ -3464,11 +3815,12 @@ function buildDiagnosticReport(job, jobId) {
 async function copyJobLog() {
   if (!activeJobId) return;
   try {
-    const job = await fetch(`/api/job/${activeJobId}`).then(r => r.json());
+    const job = await fetch(`/api/job/${activeJobId}?diag=1`).then(r => r.json());
     if (job.error) {
       alert(job.error);
       return;
     }
+    if (accumulatedLog[activeJobId]) job.log = accumulatedLog[activeJobId];
     await navigator.clipboard.writeText(buildDiagnosticReport(job, activeJobId));
     const b = document.getElementById('btnCopyLog');
     if (b) {
@@ -3483,13 +3835,14 @@ async function copyJobLog() {
 
 function saveJobLog() {
   if (!activeJobId) return;
-  fetch(`/api/job/${activeJobId}`)
+  fetch(`/api/job/${activeJobId}?diag=1`)
     .then(r => r.json())
     .then(job => {
       if (job.error) {
         alert(job.error);
         return;
       }
+      if (accumulatedLog[activeJobId]) job.log = accumulatedLog[activeJobId];
       const text = buildDiagnosticReport(job, activeJobId);
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const a = document.createElement('a');
@@ -3525,9 +3878,14 @@ function selectJob(jobId) {
 // ──────────────────────────────────────────────────────────────────────────────
 async function pollJob(jobId) {
   let job;
-  try { job = await fetch(`/api/job/${jobId}`).then(r => r.json()); }
+  const since = logOffset[jobId] || 0;
+  try { job = await fetch(`/api/job/${jobId}?log_since=${since}`).then(r => r.json()); }
   catch(e) { return; }
   if (job.error) return;
+  if (!accumulatedLog[jobId]) accumulatedLog[jobId] = [];
+  if (job.log && job.log.length) accumulatedLog[jobId].push(...job.log);
+  if (job.log_total != null) logOffset[jobId] = job.log_total;
+  job.log = accumulatedLog[jobId];
 
   const prevSuccess = jobSuccessSeen[jobId];
   if (prevSuccess === undefined) {
@@ -3921,6 +4279,20 @@ function initGalleryObserver() {
   });
 }
 
+function startAlbumChangePoller() {
+  if (albumMtimeTimer) clearInterval(albumMtimeTimer);
+  albumMtimeTimer = setInterval(async () => {
+    try {
+      const data = await fetch('/api/albums/mtime').then(r => r.json());
+      const mt = data.mtime;
+      if (albumMtimeLast !== null && mt !== albumMtimeLast) {
+        await loadGallery();
+      }
+      albumMtimeLast = mt;
+    } catch (_) {}
+  }, 2000);
+}
+
 async function loadGallery() {
   const [galleryRes, albumsRes] = await Promise.all([fetch('/api/gallery'), fetch('/api/albums')]);
   allGalleryItems = await galleryRes.json();
@@ -3933,6 +4305,8 @@ async function loadGallery() {
   }
   renderSidebar();
   renderGallery();
+  // Sync mtime baseline so the change poller doesn't re-fire immediately
+  fetch('/api/albums/mtime').then(r => r.json()).then(d => { albumMtimeLast = d.mtime; }).catch(() => {});
 }
 
 function mergeGallery(newItems) {
@@ -4000,6 +4374,11 @@ function selectAlbum(albumName) {
   // Task 19.8: Clear undo history when navigating to different album
   // Requirements 10.6: Clear undo history on state transitions
   undoManager.clear();
+  
+  // Task 8.1: Clear multi-album selection when switching to single-album view
+  // Requirements 4.1: Ensure multi-select doesn't interfere with album navigation
+  albumSelectionManager.clearSelection();
+  updateAlbumVisualSelection();
   
   currentAlbum = albumName;
   _galleryScrollTop = 0;
@@ -4120,7 +4499,10 @@ function renderSidebar() {
       ondragend="sidebarAlbumDragEnd(event)"
       ondragover="sidebarDragOver(event)"
       ondragleave="sidebarDragLeave(event)"
-      ondrop="sidebarDrop(event)">
+      ondrop="sidebarDrop(event)"
+      tabindex="0"
+      role="button"
+      aria-label="Album: ${escHtml(albumName)}, ${fileCount} files">
       <span class="sidebar-album-name">${escHtml(albumName)}</span>
       ${srcLink}
       <span class="sidebar-count">${fileCount || ''}</span>
@@ -4152,7 +4534,10 @@ function renderSidebar() {
           onclick="selectAlbum(this.dataset.album)"
           ondragover="sidebarDragOver(event)"
           ondragleave="sidebarDragLeave(event)"
-          ondrop="sidebarDrop(event)">
+          ondrop="sidebarDrop(event)"
+          tabindex="0"
+          role="button"
+          aria-label="Nested album: ${escHtml(subDisplay)}, ${subCount} files">
           <span class="sidebar-album-name">${escHtml(subDisplay)}</span>
           ${subSrcLink}
           <span class="sidebar-count">${subCount || ''}</span>
@@ -4919,59 +5304,21 @@ async function sidebarDrop(e) {
 }
 
 async function mergeAlbums(sourceAlbum, targetAlbum) {
-  // Fetch fresh gallery data FIRST to avoid stale array issues
-  const freshGallery = await fetch('/api/gallery').then(r => r.json());
-  const filesToMove = freshGallery.filter(item => item.album === sourceAlbum);
-  
-  if (filesToMove.length === 0) {
-    alert('Source album is empty');
+  const res = await fetch('/api/albums/merge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceAlbums: [sourceAlbum], targetAlbumName: targetAlbum })
+  }).then(r => r.json());
+
+  if (!res.success) {
+    const errMsg = res.errors && res.errors.length ? res.errors[0].error : (res.error || 'unknown error');
+    alert(`Merge failed: ${errMsg}`);
     return;
   }
-  
-  // Update global array with fresh data
-  allGalleryItems = freshGallery;
-  
-  let moved = 0;
-  let failed = 0;
-  
-  for (const item of filesToMove) {
-    const result = await fetch('/api/album/move-file', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        album: sourceAlbum,
-        filename: item.name,
-        target_album: targetAlbum
-      })
-    }).then(r => r.json());
-    
-    if (result.error) {
-      failed++;
-    } else {
-      moved++;
-      // Update item in allGalleryItems
-      item.album = targetAlbum;
-      item.name = result.new_filename;
-    }
-  }
-  
-  alert(`Merged ${moved} file(s) from "${sourceAlbum}" to "${targetAlbum}"${failed > 0 ? `\n${failed} failed` : ''}`);
 
-  // Only delete the source directory if every file was moved successfully
-  if (failed === 0) {
-    await fetch('/api/album/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ album_name: sourceAlbum })
-    });
-    knownAlbums = knownAlbums.filter(a => a.name !== sourceAlbum);
-  } else {
-    const remaining = allGalleryItems.filter(i => i.album === sourceAlbum);
-    if (remaining.length === 0) knownAlbums = knownAlbums.filter(a => a.name !== sourceAlbum);
-  }
-  
-  rebuildAlbumFilter();
-  renderGallery();
+  alert(`Merged ${res.filesMoved} file(s) from "${sourceAlbum}" into "${targetAlbum}"`);
+  currentAlbum = targetAlbum;
+  await loadGallery();
 }
 
 // Show dialog for merge or nest action
@@ -5261,6 +5608,307 @@ async function sidebarDeleteAlbum(e, albumName) {
 
 function startAlbumRename(e, btn) { sidebarRenameAlbum(e, btn.dataset.album); }
 function deleteAlbum(e, btn) { sidebarDeleteAlbum(e, btn.dataset.album); }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Album Multi-Select Event Handlers
+// Task 2.1, 2.2, 2.3: Mouse event handlers for album selection
+// Requirements 2.1.1, 2.1.2, 2.1.3, 2.1.4
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Drag selection state
+let albumDragStartX = 0;
+let albumDragStartY = 0;
+const ALBUM_DRAG_THRESHOLD = 5; // pixels
+
+// Flag set while rubber-band selection is active in the sidebar
+let albumRubberBandActive = false;
+
+/**
+ * Task 2.1: Handle mouse down on album elements
+ * Requirements 2.1.1, 2.1.2, 2.1.3, 2.1.4
+ */
+function handleAlbumMouseDown(event, albumElement) {
+  // Ignore if clicking on buttons or links
+  if (event.target.tagName === 'BUTTON' || event.target.tagName === 'A') {
+    return;
+  }
+  
+  // Ignore right-click (handled by context menu)
+  if (event.button === 2) {
+    return;
+  }
+  
+  const albumName = albumElement.dataset.album;
+  const isShiftKey = event.shiftKey;
+  const isCtrlOrCmd = event.ctrlKey || event.metaKey;
+  
+  if (isShiftKey) {
+    // Range selection from last clicked to current
+    const lastClicked = albumSelectionManager.getLastClickedAlbum();
+    if (lastClicked) {
+      albumSelectionManager.selectRange(lastClicked, albumName);
+    } else {
+      albumSelectionManager.selectAlbum(albumName);
+    }
+  } else if (isCtrlOrCmd) {
+    // Toggle individual album
+    albumSelectionManager.toggleAlbum(albumName);
+  } else {
+    // Single selection (clear others)
+    albumSelectionManager.clearSelection();
+    albumSelectionManager.selectAlbum(albumName);
+  }
+  
+  albumSelectionManager.setLastClickedAlbum(albumName);
+  
+  // Initialize drag selection tracking
+  albumSelectionManager.startDragSelection(albumName);
+  albumDragStartX = event.clientX;
+  albumDragStartY = event.clientY;
+  
+  updateAlbumVisualSelection();
+  
+  // Prevent text selection during drag
+  event.preventDefault();
+}
+
+/**
+ * Task 2.2, 8.4: Handle mouse move during drag selection with performance optimization
+ * Requirements 2.1.4, 2.5.2, 3.1.1, 3.1.2
+ */
+let albumDragUpdateScheduled = false;
+let albumDragLastUpdate = 0;
+const ALBUM_DRAG_DEBOUNCE_MS = 16; // 60 FPS
+
+function handleAlbumMouseMove(event) {
+  if (!albumSelectionManager.dragStartAlbum) return;
+  
+  // Check if mouse moved beyond threshold
+  if (!albumSelectionManager.isDragging) {
+    const distance = Math.sqrt(
+      Math.pow(event.clientX - albumDragStartX, 2) + 
+      Math.pow(event.clientY - albumDragStartY, 2)
+    );
+    if (distance < ALBUM_DRAG_THRESHOLD) {
+      return;
+    }
+  }
+  
+  // Task 8.4: Debounce drag selection updates (16ms / 60 FPS)
+  // Requirements 3.1.1: Selection operations must feel instant (60 FPS)
+  const now = Date.now();
+  if (now - albumDragLastUpdate < ALBUM_DRAG_DEBOUNCE_MS) {
+    return;
+  }
+  albumDragLastUpdate = now;
+  
+  // Task 8.4: Use requestAnimationFrame for smooth updates
+  // Requirements 3.1.1: Minimize reflows and repaints
+  if (albumDragUpdateScheduled) return;
+  
+  albumDragUpdateScheduled = true;
+  requestAnimationFrame(() => {
+    albumDragUpdateScheduled = false;
+    
+    // Find album element under cursor
+    const hoveredElement = document.elementFromPoint(event.clientX, event.clientY);
+    const albumElement = hoveredElement?.closest('.sidebar-album');
+    
+    if (albumElement) {
+      const currentAlbum = albumElement.dataset.album;
+      albumSelectionManager.updateDragSelection(currentAlbum);
+      updateAlbumVisualSelection();
+    }
+  });
+}
+
+/**
+ * Task 2.3: Handle mouse up to finalize selection
+ * Requirements 2.1.4
+ */
+function handleAlbumMouseUp(event) {
+  if (albumRubberBandActive) return; // rubber-band mouseup handled separately
+
+  if (albumSelectionManager.isDragging) {
+    albumSelectionManager.endDragSelection();
+  } else {
+    // If not dragging, treat as a click to navigate to the album
+    const selectedAlbums = albumSelectionManager.getSelectedAlbums();
+    if (selectedAlbums.length === 1 && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+      // Single album selected without modifiers - navigate to it
+      selectAlbum(selectedAlbums[0]);
+      albumSelectionManager.clearSelection();
+      updateAlbumVisualSelection();
+    }
+  }
+  
+  albumSelectionManager.dragStartAlbum = null;
+  albumSelectionManager.isDragging = false;
+}
+
+/**
+ * Task 3.2, 8.4: Update visual selection state for all albums with performance optimization
+ * Requirements 2.5.1, 3.1.1: Batch DOM updates to minimize reflows
+ */
+function updateAlbumVisualSelection() {
+  // Task 8.4: Batch DOM updates using requestAnimationFrame
+  // Requirements 3.1.1: Minimize reflows and repaints during selection updates
+  requestAnimationFrame(() => {
+    const allAlbumElements = document.querySelectorAll('.sidebar-album');
+    
+    // Task 8.4: Batch all class changes before applying
+    // This minimizes reflows by doing all reads first, then all writes
+    const updates = [];
+    
+    allAlbumElements.forEach(element => {
+      const albumName = element.dataset.album;
+      const shouldBeSelected = albumSelectionManager.isSelected(albumName);
+      const isCurrentlySelected = element.classList.contains('multi-selected');
+      
+      if (shouldBeSelected !== isCurrentlySelected) {
+        updates.push({ element, shouldBeSelected });
+      }
+    });
+    
+    // Apply all updates in a batch
+    updates.forEach(({ element, shouldBeSelected }) => {
+      if (shouldBeSelected) {
+        element.classList.add('multi-selected');
+      } else {
+        element.classList.remove('multi-selected');
+      }
+    });
+    
+    // Task 3.3: Update selection count indicator
+    updateAlbumSelectionCount();
+  });
+}
+
+/**
+ * Task 3.3, 8.5: Update selection count indicator with accessibility
+ * Requirements 2.5.1, 3.2.2: ARIA live region for selection count announcements
+ */
+function updateAlbumSelectionCount() {
+  const count = albumSelectionManager.getSelectionCount();
+  let indicator = document.getElementById('albumSelectionCount');
+  
+  if (!indicator) {
+    // Create indicator if it doesn't exist
+    const sidebar = document.getElementById('gallerySidebar');
+    if (sidebar) {
+      indicator = document.createElement('div');
+      indicator.id = 'albumSelectionCount';
+      indicator.className = 'album-selection-count';
+      // Task 8.5: Add ARIA live region for screen reader announcements
+      indicator.setAttribute('role', 'status');
+      indicator.setAttribute('aria-live', 'polite');
+      indicator.setAttribute('aria-atomic', 'true');
+      document.body.appendChild(indicator);
+    }
+  }
+  
+  if (indicator) {
+    if (count > 1) {
+      const albumText = count === 1 ? 'album' : 'albums';
+      indicator.textContent = `${count} ${albumText} selected`;
+      indicator.style.display = 'block';
+      // Task 8.5: Update ARIA label for screen readers
+      indicator.setAttribute('aria-label', `${count} ${albumText} selected`);
+    } else {
+      indicator.style.display = 'none';
+      indicator.setAttribute('aria-label', 'No albums selected');
+    }
+  }
+}
+
+/**
+ * Task 2.4: Attach event listeners to sidebar
+ * Requirements 2.1.1, 2.1.2, 2.1.3, 2.1.4
+ */
+function attachAlbumSelectionListeners() {
+  const sidebar = document.getElementById('gallerySidebar');
+  if (!sidebar) return;
+  
+  // Use event delegation for mousedown on album elements
+  sidebar.addEventListener('mousedown', (event) => {
+    const albumElement = event.target.closest('.sidebar-album');
+    if (albumElement) {
+      handleAlbumMouseDown(event, albumElement);
+    }
+  });
+  
+  // Document-level listeners for drag operations
+  document.addEventListener('mousemove', handleAlbumMouseMove);
+  document.addEventListener('mouseup', handleAlbumMouseUp);
+}
+
+/**
+ * Rubber-band drag selection for the album sidebar (mirrors gallery setupSelectionBoxHandlers).
+ * Activates when the user presses the mouse button on empty sidebar space and drags.
+ */
+function setupAlbumSelectionBoxHandlers() {
+  const sidebar = document.getElementById('gallerySidebar');
+  if (!sidebar) return;
+
+  let startX = 0, startY = 0;
+  let rafId = null;
+
+  sidebar.addEventListener('mousedown', (e) => {
+    // Only trigger on left-button presses on empty sidebar space
+    if (e.button !== 0) return;
+    if (e.target.closest('.sidebar-album')) return;
+
+    e.preventDefault();
+    albumRubberBandActive = true;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    if (!e.ctrlKey && !e.metaKey) {
+      albumSelectionManager.clearSelection();
+      updateAlbumVisualSelection();
+    }
+
+    visualFeedback.renderSelectionBox(startX, startY, startX, startY);
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!albumRubberBandActive) return;
+
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+
+      const curX = e.clientX;
+      const curY = e.clientY;
+
+      visualFeedback.renderSelectionBox(startX, startY, curX, curY);
+
+      // Compute selection box bounds in viewport coordinates
+      const boxLeft   = Math.min(startX, curX);
+      const boxRight  = Math.max(startX, curX);
+      const boxTop    = Math.min(startY, curY);
+      const boxBottom = Math.max(startY, curY);
+
+      // Select all album elements that intersect the box
+      albumSelectionManager.clearSelection();
+      document.querySelectorAll('.sidebar-album').forEach(el => {
+        const r = el.getBoundingClientRect();
+        const hits = !(r.right < boxLeft || r.left > boxRight || r.bottom < boxTop || r.top > boxBottom);
+        if (hits) albumSelectionManager.selectAlbum(el.dataset.album);
+      });
+
+      updateAlbumVisualSelection();
+    });
+  });
+
+  document.addEventListener('mouseup', (e) => {
+    if (!albumRubberBandActive) return;
+    albumRubberBandActive = false;
+    visualFeedback.clearSelectionBox();
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    updateAlbumVisualSelection();
+  });
+}
 
 // Boot
 // ──────────────────────────────────────────────────────────────────────────────
@@ -5754,7 +6402,22 @@ document.addEventListener('keydown', (e) => {
     if (isGalleryActive) {
       e.preventDefault();
       e.stopPropagation();
-      selectAllVisibleThumbs();
+      
+      // Task 7.2: Check if sidebar has focus or is being interacted with
+      // If an album is focused/hovered, select all albums instead of files
+      const sidebarHasFocus = document.activeElement?.closest('.gallery-sidebar') || 
+                              document.querySelector('.sidebar-album:hover');
+      
+      if (sidebarHasFocus) {
+        // Select all albums
+        const allAlbumElements = Array.from(document.querySelectorAll('.sidebar-album'));
+        const allAlbumNames = allAlbumElements.map(el => el.dataset.album);
+        albumSelectionManager.selectAll(allAlbumNames);
+        updateAlbumVisualSelection();
+      } else {
+        // Select all files in current album
+        selectAllVisibleThumbs();
+      }
     }
   }
   
@@ -5809,6 +6472,8 @@ document.addEventListener('keydown', (e) => {
     const selectionListModal = document.getElementById('selectionListModal');
     const contextMenu = document.getElementById('contextMenu');
     const albumContextMenu = document.getElementById('albumContextMenu');
+    const multiAlbumContextMenu = document.getElementById('multiAlbumContextMenu');
+    
     if (document.querySelector('.lightbox.open')) {
       closeLightbox();
     } else if (selectionListModal && selectionListModal.classList.contains('visible')) {
@@ -5817,8 +6482,26 @@ document.addEventListener('keydown', (e) => {
       closeContextMenu();
     } else if (albumContextMenu && albumContextMenu.classList.contains('visible')) {
       closeAlbumContextMenu();
+    } else if (multiAlbumContextMenu && multiAlbumContextMenu.classList.contains('visible')) {
+      // Task 7.1: Close multi-album context menu on Escape
+      closeMultiAlbumContextMenu();
+    } else if (albumSelectionManager.getSelectionCount() > 0) {
+      // Task 7.1: Clear album selection on Escape
+      // Requirements 2.1.5: Selection clearing
+      albumSelectionManager.clearSelection();
+      updateAlbumVisualSelection();
     } else if (selectionManager.getCount() > 0) {
       clearSelection();
+    }
+  }
+  
+  // Task 8.5: Enter key to activate focused context menu item
+  // Requirements 3.2.2: Ensure keyboard navigation works for context menu
+  if (e.key === 'Enter') {
+    const focusedElement = document.activeElement;
+    if (focusedElement && focusedElement.classList.contains('context-menu-item')) {
+      e.preventDefault();
+      focusedElement.click();
     }
   }
 });
@@ -5889,7 +6572,6 @@ function updateContextMenuItems(hasSelection) {
   document.getElementById('ctxCreateNestedAlbum').classList.toggle('disabled', !currentAlbum);
   
   // Options that require selection
-  document.getElementById('ctxCreateAlbumAndMove').classList.toggle('disabled', selectionCount === 0);
   document.getElementById('ctxMoveToNewAlbum').classList.toggle('disabled', selectionCount === 0);
   document.getElementById('ctxCopyPath').classList.toggle('disabled', selectionCount === 0);
   document.getElementById('ctxDeleteSelected').classList.toggle('disabled', selectionCount === 0);
@@ -5976,98 +6658,24 @@ async function contextMenuCreateNestedAlbum() {
 }
 
 /**
- * Creates a new album and moves selected files into it
- */
-async function contextMenuCreateAlbumAndMove() {
-  // Check if button is disabled
-  const btn = document.getElementById('ctxCreateAlbumAndMove');
-  if (btn && btn.classList.contains('disabled')) return;
-  
-  closeContextMenu();
-  
-  const selectionCount = selectionManager.getCount();
-  if (selectionCount === 0) {
-    alert('No files selected');
-    return;
-  }
-  
-  const name = prompt(`Create album and move ${selectionCount} selected file(s):`);
-  if (!name?.trim()) return;
-  
-  // Ask if nested or top-level
-  let parent = '';
-  if (currentAlbum) {
-    const topLevel = currentAlbum.split('/')[0];
-    const doNest = confirm(
-      `Create "${name.trim()}" inside "${topLevel}"?\n\n` +
-      `OK → nested inside "${topLevel}"\n` +
-      `Cancel → new top-level album`
-    );
-    parent = doNest ? topLevel : '';
-  }
-  
-  // Create the album
-  const createRes = await fetch('/api/album/create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name.trim(), parent })
-  }).then(r => r.json());
-  
-  if (createRes.error) {
-    alert('Error creating album: ' + createRes.error);
-    return;
-  }
-  
-  const newAlbumName = createRes.name;
-  knownAlbums.push({ name: newAlbumName, album_url: null });
-  
-  // Move selected files to the new album
-  const selectedItems = selectionManager.getAll();
-  const movePromises = selectedItems.map(item => {
-    return fetch('/api/move', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        album: item.album,
-        filename: item.filename,
-        target_album: newAlbumName
-      })
-    }).then(r => r.json());
-  });
-  
-  const results = await Promise.all(movePromises);
-  const errors = results.filter(r => r.error);
-  
-  if (errors.length > 0) {
-    alert(`Moved ${results.length - errors.length} files, ${errors.length} failed`);
-  }
-  
-  // Update gallery
-  clearSelection();
-  await loadGallery();
-  selectAlbum(newAlbumName);
-}
-
-/**
  * Prompts for album name and moves selected files
  */
 async function contextMenuMoveToNewAlbum() {
-  // Check if button is disabled
   const btn = document.getElementById('ctxMoveToNewAlbum');
   if (btn && btn.classList.contains('disabled')) return;
-  
+
   closeContextMenu();
-  
-  const selectionCount = selectionManager.getCount();
-  if (selectionCount === 0) {
+
+  const selectedItems = selectionManager.getSelectedItems();
+  console.log('[MoveToNewAlbum] selectedItems:', JSON.stringify(selectedItems));
+  if (selectedItems.length === 0) {
     alert('No files selected');
     return;
   }
-  
-  const name = prompt(`Move ${selectionCount} selected file(s) to new album:`);
+
+  const name = prompt(`Move ${selectedItems.length} selected file(s) to new album:`);
   if (!name?.trim()) return;
-  
-  // Ask if nested or top-level
+
   let parent = '';
   if (currentAlbum) {
     const topLevel = currentAlbum.split('/')[0];
@@ -6078,46 +6686,59 @@ async function contextMenuMoveToNewAlbum() {
     );
     parent = doNest ? topLevel : '';
   }
-  
-  // Create the album
-  const createRes = await fetch('/api/album/create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name.trim(), parent })
-  }).then(r => r.json());
-  
-  if (createRes.error) {
-    alert('Error creating album: ' + createRes.error);
-    return;
-  }
-  
-  const newAlbumName = createRes.name;
-  knownAlbums.push({ name: newAlbumName, album_url: null });
-  
-  // Move selected files
-  const selectedItems = selectionManager.getAll();
-  const movePromises = selectedItems.map(item => {
-    return fetch('/api/move', {
+
+  console.log('[MoveToNewAlbum] creating album:', name.trim(), 'parent:', parent);
+
+  let newAlbumName;
+  try {
+    const createResp = await fetch('/api/album/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        album: item.album,
-        filename: item.filename,
-        target_album: newAlbumName
-      })
-    }).then(r => r.json());
-  });
-  
-  const results = await Promise.all(movePromises);
-  const errors = results.filter(r => r.error);
-  
-  if (errors.length > 0) {
-    alert(`Moved ${results.length - errors.length} files, ${errors.length} failed`);
+      body: JSON.stringify({ name: name.trim(), parent })
+    });
+    const createRes = await createResp.json();
+    console.log('[MoveToNewAlbum] create response:', createResp.status, JSON.stringify(createRes));
+    if (!createResp.ok || createRes.error) {
+      alert('Error creating album: ' + (createRes.error || `HTTP ${createResp.status}`));
+      return;
+    }
+    newAlbumName = createRes.name;
+  } catch (err) {
+    alert('Failed to create album: ' + err.message);
+    console.error('[MoveToNewAlbum] create error:', err);
+    return;
   }
-  
-  // Update gallery
+
+  console.log('[MoveToNewAlbum] newAlbumName:', newAlbumName, '— moving', selectedItems.length, 'files');
+  knownAlbums.push({ name: newAlbumName, album_url: null });
+
+  const moveResults = await Promise.allSettled(
+    selectedItems.map(item =>
+      fetch('/api/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          album: item.album,
+          filename: item.filename,
+          target_album: newAlbumName
+        })
+      })
+      .then(r => r.json())
+    )
+  );
+
+  console.log('[MoveToNewAlbum] moveResults:', JSON.stringify(moveResults));
+  const failed = moveResults.filter(r => r.status === 'rejected' || r.value?.error);
+  if (failed.length > 0) {
+    alert(`Moved ${moveResults.length - failed.length} of ${moveResults.length} files. ${failed.length} failed.`);
+  }
+
   clearSelection();
-  await loadGallery();
+  try {
+    await loadGallery();
+  } catch (err) {
+    console.error('[MoveToNewAlbum] loadGallery error:', err);
+  }
   selectAlbum(newAlbumName);
 }
 
@@ -6137,7 +6758,7 @@ function contextMenuSelectAll() {
   
   const itemsInAlbum = allGalleryItems.filter(item => item.album === currentAlbum);
   itemsInAlbum.forEach(item => {
-    selectionManager.add(item.album, item.filename);
+    selectionManager.add(item.album, item.name);
   });
   
   updateVisualFeedback();
@@ -6157,10 +6778,10 @@ function contextMenuInvertSelection() {
   
   const itemsInAlbum = allGalleryItems.filter(item => item.album === currentAlbum);
   itemsInAlbum.forEach(item => {
-    if (selectionManager.has(item.album, item.filename)) {
-      selectionManager.remove(item.album, item.filename);
+    if (selectionManager.isSelected(item.album, item.name)) {
+      selectionManager.remove(item.album, item.name);
     } else {
-      selectionManager.add(item.album, item.filename);
+      selectionManager.add(item.album, item.name);
     }
   });
   
@@ -6191,7 +6812,7 @@ async function contextMenuCopyPath() {
   
   closeContextMenu();
   
-  const selectedItems = selectionManager.getAll();
+  const selectedItems = selectionManager.getSelectedItems();
   if (selectedItems.length === 0) {
     alert('No files selected');
     return;
@@ -6419,10 +7040,28 @@ function setupAlbumContextMenuHandlers() {
     const albumElement = e.target.closest('.sidebar-album');
     
     if (albumElement) {
-      // Right-clicked on an album
+      // Task 4.3: Handle right-click on album element
+      // Requirements 2.2.1, 2.2.2
       const albumName = albumElement.dataset.album;
       if (albumName) {
-        showAlbumContextMenu(e.pageX, e.pageY, albumName);
+        // Check if right-clicked album is in selection
+        if (!albumSelectionManager.isSelected(albumName)) {
+          // If not in selection, clear selection and select only clicked album
+          albumSelectionManager.clearSelection();
+          albumSelectionManager.selectAlbum(albumName);
+          updateAlbumVisualSelection();
+        }
+        
+        // Get final selection count
+        const selectionCount = albumSelectionManager.getSelectionCount();
+        
+        if (selectionCount > 1) {
+          // Show multi-album context menu
+          showMultiAlbumContextMenu(e.pageX, e.pageY, albumSelectionManager.getSelectedAlbums());
+        } else {
+          // Show single-album context menu
+          showAlbumContextMenu(e.pageX, e.pageY, albumName);
+        }
       }
     } else {
       // Right-clicked on empty space in sidebar
@@ -6434,11 +7073,14 @@ function setupAlbumContextMenuHandlers() {
   // Click outside album context menu - close it
   document.addEventListener('click', (e) => {
     const albumContextMenu = document.getElementById('albumContextMenu');
-    if (!albumContextMenu) return;
+    const multiAlbumContextMenu = document.getElementById('multiAlbumContextMenu');
     
-    // If clicking outside the album context menu, close it
-    if (!albumContextMenu.contains(e.target) && albumContextMenu.classList.contains('visible')) {
+    if (albumContextMenu && !albumContextMenu.contains(e.target) && albumContextMenu.classList.contains('visible')) {
       closeAlbumContextMenu();
+    }
+    
+    if (multiAlbumContextMenu && !multiAlbumContextMenu.contains(e.target) && multiAlbumContextMenu.classList.contains('visible')) {
+      closeMultiAlbumContextMenu();
     }
   });
   
@@ -6481,11 +7123,13 @@ async function albumContextCreateNested() {
   const btn = document.getElementById('albumCtxCreateNested');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) return;
+  if (!albumName) return;
   
-  const topLevel = contextAlbumName.split('/')[0];
+  const topLevel = albumName.split('/')[0];
   const name = prompt(`Create nested album inside "${topLevel}":`);
   if (!name?.trim()) return;
   
@@ -6513,22 +7157,24 @@ async function albumContextRename() {
   const btn = document.getElementById('albumCtxRename');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) return;
+  if (!albumName) return;
   
-  const currentLeaf = contextAlbumName.split('/').pop();
+  const currentLeaf = albumName.split('/').pop();
   const newLeaf = prompt(`Rename "${currentLeaf}" to:`, currentLeaf);
   if (!newLeaf || newLeaf === currentLeaf) return;
   
-  const final = contextAlbumName.includes('/')
-    ? contextAlbumName.replace(/[^/]+$/, newLeaf)
+  const final = albumName.includes('/')
+    ? albumName.replace(/[^/]+$/, newLeaf)
     : newLeaf;
   
   const d = await fetch('/api/album/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ old_name: contextAlbumName, new_name: final })
+    body: JSON.stringify({ old_name: albumName, new_name: final })
   }).then(r => r.json());
   
   if (d.error) {
@@ -6536,8 +7182,8 @@ async function albumContextRename() {
     return;
   }
   
-  for (const a of knownAlbums) { if (a.name === contextAlbumName) a.name = final; }
-  if (currentAlbum === contextAlbumName) currentAlbum = final;
+  for (const a of knownAlbums) { if (a.name === albumName) a.name = final; }
+  if (currentAlbum === albumName) currentAlbum = final;
   renderSidebar();
   renderGallery();
 }
@@ -6551,21 +7197,23 @@ async function albumContextDuplicate() {
   const btn = document.getElementById('albumCtxDuplicate');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) return;
+  if (!albumName) return;
   
-  const filesInAlbum = allGalleryItems.filter(i => i.album === contextAlbumName);
+  const filesInAlbum = allGalleryItems.filter(i => i.album === albumName);
   if (filesInAlbum.length === 0) {
     alert('Album is empty, nothing to duplicate');
     return;
   }
   
-  const newName = prompt(`Duplicate "${contextAlbumName}" as:`, `${contextAlbumName} (Copy)`);
+  const newName = prompt(`Duplicate "${albumName}" as:`, `${albumName} (Copy)`);
   if (!newName?.trim()) return;
   
   // Create the new album
-  const parent = contextAlbumName.includes('/') ? contextAlbumName.split('/')[0] : '';
+  const parent = albumName.includes('/') ? albumName.split('/')[0] : '';
   const createRes = await fetch('/api/album/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -6615,11 +7263,13 @@ async function albumContextMerge() {
   const btn = document.getElementById('albumCtxMerge');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) return;
+  if (!albumName) return;
   
-  const filesInAlbum = allGalleryItems.filter(i => i.album === contextAlbumName);
+  const filesInAlbum = allGalleryItems.filter(i => i.album === albumName);
   if (filesInAlbum.length === 0) {
     alert('Album is empty, nothing to merge');
     return;
@@ -6628,7 +7278,7 @@ async function albumContextMerge() {
   // Get list of other albums
   const otherAlbums = knownAlbums
     .map(a => a.name)
-    .filter(name => name !== contextAlbumName);
+    .filter(name => name !== albumName);
   
   if (otherAlbums.length === 0) {
     alert('No other albums available to merge with');
@@ -6636,13 +7286,13 @@ async function albumContextMerge() {
   }
   
   // Show album selection dialog
-  const targetAlbum = await showAlbumSelectionDialog(contextAlbumName, otherAlbums, filesInAlbum.length);
+  const targetAlbum = await showAlbumSelectionDialog(albumName, otherAlbums, filesInAlbum.length);
   
   if (!targetAlbum) return;
   
   const confirmed = confirm(
-    `Move all ${filesInAlbum.length} files from "${contextAlbumName}" to "${targetAlbum}"?\n\n` +
-    `The source album "${contextAlbumName}" will be deleted after the merge.`
+    `Move all ${filesInAlbum.length} files from "${albumName}" to "${targetAlbum}"?\n\n` +
+    `The source album "${albumName}" will be deleted after the merge.`
   );
   
   if (!confirmed) return;
@@ -6671,7 +7321,7 @@ async function albumContextMerge() {
   const deleteRes = await fetch('/api/album/delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: contextAlbumName })
+    body: JSON.stringify({ name: albumName })
   }).then(r => r.json());
   
   if (deleteRes.error) {
@@ -6679,7 +7329,7 @@ async function albumContextMerge() {
   }
   
   // Update UI
-  knownAlbums = knownAlbums.filter(a => a.name !== contextAlbumName);
+  knownAlbums = knownAlbums.filter(a => a.name !== albumName);
   await loadGallery();
   selectAlbum(targetAlbum);
 }
@@ -6729,9 +7379,11 @@ async function albumContextOpenFolder() {
   const btn = document.getElementById('albumCtxOpenFolder');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) {
+  if (!albumName) {
     console.warn('albumContextOpenFolder: No album selected');
     return;
   }
@@ -6740,7 +7392,7 @@ async function albumContextOpenFolder() {
     const response = await fetch('/api/open-folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ album: contextAlbumName })
+      body: JSON.stringify({ album: albumName })
     });
     
     const data = await response.json();
@@ -6748,7 +7400,7 @@ async function albumContextOpenFolder() {
     if (data.error) {
       alert('Error opening folder: ' + data.error);
     } else if (data.ok) {
-      console.log('Folder opened successfully:', contextAlbumName);
+      console.log('Folder opened successfully:', albumName);
     }
   } catch (err) {
     console.error('Failed to open folder:', err);
@@ -6765,14 +7417,16 @@ async function albumContextCopyPath() {
   const btn = document.getElementById('albumCtxCopyPath');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) {
+  if (!albumName) {
     console.warn('albumContextCopyPath: No album selected');
     return;
   }
   
-  const path = `Downloads/${contextAlbumName}`;
+  const path = `Downloads/${albumName}`;
   
   try {
     await navigator.clipboard.writeText(path);
@@ -6851,21 +7505,23 @@ async function albumContextDelete() {
   const btn = document.getElementById('albumCtxDelete');
   if (btn && btn.classList.contains('disabled')) return;
   
+  // Save contextAlbumName before closing menu
+  const albumName = contextAlbumName;
   closeAlbumContextMenu();
   
-  if (!contextAlbumName) return;
+  if (!albumName) return;
   
-  const filesInAlbum = allGalleryItems.filter(i => i.album === contextAlbumName);
+  const filesInAlbum = allGalleryItems.filter(i => i.album === albumName);
   const msg = filesInAlbum.length > 0
-    ? `Delete album "${contextAlbumName}" and its ${filesInAlbum.length} file(s)?`
-    : `Delete empty album "${contextAlbumName}"?`;
+    ? `Delete album "${albumName}" and its ${filesInAlbum.length} file(s)?`
+    : `Delete empty album "${albumName}"?`;
   
   if (!confirm(msg)) return;
   
   const d = await fetch('/api/album/delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: contextAlbumName })
+    body: JSON.stringify({ name: albumName })
   }).then(r => r.json());
   
   if (d.error) {
@@ -6873,13 +7529,337 @@ async function albumContextDelete() {
     return;
   }
   
-  knownAlbums = knownAlbums.filter(a => a.name !== contextAlbumName);
-  if (currentAlbum === contextAlbumName) {
+  knownAlbums = knownAlbums.filter(a => a.name !== albumName);
+  if (currentAlbum === albumName) {
     const remaining = knownAlbums.map(a => a.name);
     currentAlbum = remaining[0] || '';
   }
   renderSidebar();
   renderGallery();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Multi-Album Context Menu Functions
+// Task 4.2, 4.4, 4.5: Multi-album context menu implementation
+// Requirements 2.2.1, 2.2.3
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Store selected albums for context menu actions
+let contextSelectedAlbums = [];
+
+/**
+ * Task 4.2: Show multi-album context menu
+ * Requirements 2.2.1
+ */
+function showMultiAlbumContextMenu(x, y, selectedAlbums) {
+  const multiAlbumContextMenu = document.getElementById('multiAlbumContextMenu');
+  if (!multiAlbumContextMenu) return;
+  
+  // Store selected albums for use in menu actions
+  contextSelectedAlbums = selectedAlbums;
+  
+  // Position menu at cursor location initially
+  multiAlbumContextMenu.style.left = `${x}px`;
+  multiAlbumContextMenu.style.top = `${y}px`;
+  multiAlbumContextMenu.classList.add('visible');
+  
+  // Smart positioning: prevent menu from going off-screen
+  const rect = multiAlbumContextMenu.getBoundingClientRect();
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  
+  let finalX = x;
+  let finalY = y;
+  
+  // Adjust horizontal position if menu would overflow right edge
+  if (rect.right > viewportWidth) {
+    finalX = x - rect.width;
+  }
+  
+  // Adjust vertical position if menu would overflow bottom edge
+  if (rect.bottom > viewportHeight) {
+    finalY = y - rect.height;
+  }
+  
+  // Ensure menu stays within viewport bounds
+  finalX = Math.max(10, finalX);
+  finalY = Math.max(10, finalY);
+  
+  multiAlbumContextMenu.style.left = `${finalX}px`;
+  multiAlbumContextMenu.style.top = `${finalY}px`;
+}
+
+/**
+ * Task 4.4: Close multi-album context menu
+ * Requirements 2.2.3
+ */
+function closeMultiAlbumContextMenu() {
+  const multiAlbumContextMenu = document.getElementById('multiAlbumContextMenu');
+  if (!multiAlbumContextMenu) return;
+  
+  multiAlbumContextMenu.classList.remove('visible');
+  contextSelectedAlbums = [];
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 8.2: Loading State and Progress Indicator Functions
+// Requirements 2.5.3, 3.1.2: Show progress during batch operations
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Show loading overlay with progress message
+ * @param {string} message - Main message to display
+ * @param {string} progress - Progress text (e.g., "1 of 5")
+ */
+function showBatchOperationLoading(message, progress = '') {
+  const overlay = document.getElementById('batchOperationOverlay');
+  const messageEl = document.getElementById('batchOperationMessage');
+  const progressEl = document.getElementById('batchOperationProgress');
+  
+  if (!overlay || !messageEl || !progressEl) return;
+  
+  messageEl.textContent = message;
+  progressEl.textContent = progress;
+  overlay.classList.add('visible');
+  
+  // Disable UI interactions during operation
+  document.body.style.pointerEvents = 'none';
+  overlay.style.pointerEvents = 'auto';
+}
+
+/**
+ * Hide loading overlay
+ */
+function hideBatchOperationLoading() {
+  const overlay = document.getElementById('batchOperationOverlay');
+  if (!overlay) return;
+  
+  overlay.classList.remove('visible');
+  
+  // Re-enable UI interactions
+  document.body.style.pointerEvents = 'auto';
+}
+
+/**
+ * Show toast notification
+ * @param {string} message - Message to display
+ * @param {string} type - 'success' or 'error'
+ * @param {number} autoDismiss - Auto-dismiss after milliseconds (0 = no auto-dismiss)
+ */
+function showBatchOperationToast(message, type = 'success', autoDismiss = 3000) {
+  const toast = document.getElementById('batchOperationToast');
+  const messageEl = document.getElementById('batchOperationToastMessage');
+  
+  if (!toast || !messageEl) return;
+  
+  messageEl.textContent = message;
+  toast.className = `batch-operation-toast visible ${type}`;
+  
+  // Auto-dismiss success messages after 3 seconds
+  if (autoDismiss > 0 && type === 'success') {
+    setTimeout(() => {
+      closeBatchOperationToast();
+    }, autoDismiss);
+  }
+}
+
+/**
+ * Close toast notification
+ */
+function closeBatchOperationToast() {
+  const toast = document.getElementById('batchOperationToast');
+  if (!toast) return;
+  
+  toast.classList.remove('visible');
+}
+
+/**
+ * Task 5.1, 5.2, 8.2: Batch delete albums with confirmation and loading states
+ * Requirements 2.3.1, 2.3.2, 2.3.3, 2.5.3, 3.1.2
+ */
+async function multiAlbumContextDelete() {
+  const albumsToDelete = [...contextSelectedAlbums];
+  closeMultiAlbumContextMenu();
+  contextSelectedAlbums = albumsToDelete;
+  
+  if (contextSelectedAlbums.length === 0) return;
+  
+  // Task 5.1: Show confirmation dialog
+  const totalFiles = contextSelectedAlbums.reduce((sum, albumName) => {
+    return sum + allGalleryItems.filter(i => i.album === albumName).length;
+  }, 0);
+  
+  const msg = `Delete ${contextSelectedAlbums.length} album(s) and ${totalFiles} file(s)?\n\nAlbums to delete:\n${contextSelectedAlbums.join('\n')}\n\nThis cannot be undone!`;
+  
+  if (!confirm(msg)) {
+    albumSelectionManager.clearSelection();
+    updateAlbumVisualSelection();
+    return;
+  }
+  
+  // Task 8.2: Show loading overlay
+  showBatchOperationLoading('Deleting albums...', '');
+  
+  // Task 5.2: Execute batch delete
+  const results = {
+    success: [],
+    failed: []
+  };
+  
+  const totalAlbums = contextSelectedAlbums.length;
+  
+  for (let i = 0; i < contextSelectedAlbums.length; i++) {
+    const albumName = contextSelectedAlbums[i];
+    
+    // Task 8.2: Update progress message
+    showBatchOperationLoading(
+      'Deleting albums...',
+      `Deleting ${i + 1} of ${totalAlbums} albums...`
+    );
+    
+    try {
+      const response = await fetch('/api/album/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ album_name: albumName })
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok && !data.error) {
+        results.success.push(albumName);
+        // Remove from local state
+        allGalleryItems = allGalleryItems.filter(i => i.album !== albumName);
+        knownAlbums = knownAlbums.filter(a => a.name !== albumName);
+      } else {
+        results.failed.push({ album: albumName, error: data.error || 'Unknown error' });
+      }
+    } catch (error) {
+      results.failed.push({ album: albumName, error: error.message });
+    }
+  }
+  
+  // Task 8.2: Hide loading overlay
+  hideBatchOperationLoading();
+  
+  // Task 8.2, 8.3: Show results with toast notifications
+  if (results.failed.length > 0) {
+    // Show error toast for failures (keep visible until user dismisses)
+    const failedList = results.failed.map(f => `${f.album}: ${f.error}`).join('\n');
+    showBatchOperationToast(
+      `Batch delete completed:\n\nSuccessful: ${results.success.length}\nFailed: ${results.failed.length}\n\nFailed albums:\n${failedList}`,
+      'error',
+      0 // Don't auto-dismiss errors
+    );
+  } else if (results.success.length > 0) {
+    // Task 8.2: Show success toast (auto-dismiss after 3 seconds)
+    showBatchOperationToast(
+      `Successfully deleted ${results.success.length} album(s)`,
+      'success',
+      3000
+    );
+  }
+  
+  // Update current album if it was deleted
+  if (results.success.includes(currentAlbum) || results.success.some(a => currentAlbum.startsWith(a + '/'))) {
+    const remaining = [...new Set([...knownAlbums.map(a => a.name), ...allGalleryItems.map(i => i.album)])].filter(n => !n.includes('/')).sort();
+    currentAlbum = remaining[0] || '';
+  }
+  
+  // Clear selection and refresh UI
+  albumSelectionManager.clearSelection();
+  updateAlbumVisualSelection();
+  renderSidebar();
+  renderGallery();
+}
+
+/**
+ * Task 6.1, 6.2, 8.2: Merge selected albums with loading states
+ * Requirements 2.4.1, 2.4.2, 2.5.3, 3.1.2
+ */
+async function multiAlbumContextMerge() {
+  const albumsToMerge = [...contextSelectedAlbums];
+  closeMultiAlbumContextMenu();
+  contextSelectedAlbums = albumsToMerge;
+  
+  if (contextSelectedAlbums.length < 2) {
+    showBatchOperationToast('Please select at least 2 albums to merge', 'error', 0);
+    return;
+  }
+  
+  // Task 6.1: Show merge dialog
+  const totalFiles = contextSelectedAlbums.reduce((sum, albumName) => {
+    return sum + allGalleryItems.filter(i => i.album === albumName).length;
+  }, 0);
+  
+  const targetAlbumName = prompt(
+    `Merge ${contextSelectedAlbums.length} albums (${totalFiles} files total):\n\n${contextSelectedAlbums.join('\n')}\n\nEnter target album name:`
+  );
+  
+  if (!targetAlbumName || !targetAlbumName.trim()) {
+    albumSelectionManager.clearSelection();
+    updateAlbumVisualSelection();
+    return;
+  }
+  
+  // Task 8.2: Show loading overlay
+  showBatchOperationLoading('Merging albums...', 'This may take a moment...');
+  
+  // Task 6.2: Execute merge operation
+  try {
+    const response = await fetch('/api/albums/merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceAlbums: contextSelectedAlbums,
+        targetAlbumName: targetAlbumName.trim()
+      })
+    });
+    
+    const data = await response.json();
+    
+    // Task 8.2: Hide loading overlay
+    hideBatchOperationLoading();
+    
+    if (response.ok && data.success) {
+      // Task 8.2: Show success toast (auto-dismiss after 3 seconds)
+      showBatchOperationToast(
+        `Successfully merged ${contextSelectedAlbums.length} albums into "${data.targetAlbum}"\n\nFiles moved: ${data.filesMoved}`,
+        'success',
+        3000
+      );
+      
+      // Refresh gallery
+      await loadGallery();
+      
+      // Select the merged album
+      selectAlbum(data.targetAlbum);
+    } else {
+      // Task 8.3: Show error toast with actionable guidance
+      const errorMsg = data.errors && data.errors.length > 0
+        ? data.errors.map(e => `${e.album}: ${e.error}`).join('\n')
+        : data.error || 'Unknown error';
+      showBatchOperationToast(
+        `Merge failed:\n\n${errorMsg}`,
+        'error',
+        0 // Don't auto-dismiss errors
+      );
+    }
+  } catch (error) {
+    // Task 8.2: Hide loading overlay
+    hideBatchOperationLoading();
+    
+    // Task 8.3: Show error toast
+    showBatchOperationToast(
+      `Merge failed: ${error.message}`,
+      'error',
+      0 // Don't auto-dismiss errors
+    );
+  }
+  
+  // Clear selection
+  albumSelectionManager.clearSelection();
+  updateAlbumVisualSelection();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -6899,10 +7879,6 @@ init();
   <div class="context-menu-item" id="ctxCreateNestedAlbum" onclick="contextMenuCreateNestedAlbum()">
     <span class="icon">📂</span>
     <span>Create Nested Album</span>
-  </div>
-  <div class="context-menu-item" id="ctxCreateAlbumAndMove" onclick="contextMenuCreateAlbumAndMove()">
-    <span class="icon">📦</span>
-    <span>Create Album & Move Selected</span>
   </div>
   <div class="context-menu-item" id="ctxMoveToNewAlbum" onclick="contextMenuMoveToNewAlbum()">
     <span class="icon">➜</span>
@@ -6993,6 +7969,33 @@ init();
     <span class="icon">🗑️</span>
     <span>Delete Album</span>
   </div>
+</div>
+
+<!-- Task 4.1, 8.5: Multi-Album Context Menu with Accessibility -->
+<!-- Requirements 2.2.1, 3.2.2: ARIA labels and keyboard navigation -->
+<div id="multiAlbumContextMenu" class="album-context-menu" role="menu" aria-label="Multi-album operations menu">
+  <div class="context-menu-item danger" onclick="multiAlbumContextDelete()" role="menuitem" tabindex="0" aria-label="Delete selected albums">
+    <span class="icon" aria-hidden="true">🗑️</span>
+    <span>Delete Selected Albums</span>
+  </div>
+  <div class="context-menu-item" onclick="multiAlbumContextMerge()" role="menuitem" tabindex="0" aria-label="Merge selected albums">
+    <span class="icon" aria-hidden="true">🔀</span>
+    <span>Merge Selected Albums</span>
+  </div>
+</div>
+
+<!-- Task 8.2: Loading overlay for batch operations -->
+<!-- Requirements 2.5.3, 3.1.2: Show progress during batch operations -->
+<div id="batchOperationOverlay" class="batch-operation-overlay">
+  <div class="batch-operation-spinner"></div>
+  <div class="batch-operation-message" id="batchOperationMessage">Processing...</div>
+  <div class="batch-operation-progress" id="batchOperationProgress"></div>
+</div>
+
+<!-- Task 8.2: Toast notification for batch operation results -->
+<div id="batchOperationToast" class="batch-operation-toast">
+  <button class="batch-operation-toast-close" onclick="closeBatchOperationToast()">✕</button>
+  <div id="batchOperationToastMessage"></div>
 </div>
 
 </body>

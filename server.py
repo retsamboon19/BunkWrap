@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import math
 import base64
+import html
 import zipfile
 import tarfile
 from pathlib import Path
@@ -140,10 +141,14 @@ jobs_lock = threading.Lock()
 bunkrinfo_lock = threading.Lock()
 
 # ─── Global Thread Pools ───────────────────────────────────────────────────────
-# These pools are shared across ALL album downloads to enforce global limits
+# Single resolver pool handles all URL resolutions concurrently.
+# Two semaphores enforce per-type download concurrency independently.
 
-global_image_pool = None
-global_video_pool = None
+global_resolver_pool  = None   # ThreadPoolExecutor(image_threads + video_threads)
+global_image_semaphore = None  # threading.Semaphore(image_threads)
+global_video_semaphore = None  # threading.Semaphore(video_threads)
+_current_image_threads = 0
+_current_video_threads = 0
 global_pool_lock = threading.Lock()
 
 # ─── Persistent browser pool ────────────────────────────────────────────────────
@@ -262,9 +267,13 @@ class BrowserPool:
                     }
                 """)
                 if js_url and get_ext(js_url) in VIDEO_EXTS:
-                    html = f'<html><body><video src="{js_url}"></video></body></html>'
+                    escaped_url = html.escape(js_url)
+                    html_content = f'<html><body><video src="{escaped_url}"></video></body></html>'
+                    html = html_content
                 elif js_url and get_ext(js_url) in IMAGE_EXTS:
-                    html = f'<html><body><img src="{js_url}"></body></html>'
+                    escaped_url = html.escape(js_url)
+                    html_content = f'<html><body><img src="{escaped_url}"></body></html>'
+                    html = html_content
                 else:
                     html = page.content()
             except Exception:
@@ -345,15 +354,16 @@ def update_bunkrinfo_remove(album_dir, filename):
         The URL associated with the removed file, or None if not found
     
     Note:
-        This function should be called within a bunkrinfo_lock context.
+        This function now handles locking internally for thread safety.
     """
-    info = _bunkrinfo_read(album_dir)
-    files = info.get("files", {})
-    url = files.pop(filename, None)
-    if url is not None:
-        info["files"] = files
-        _bunkrinfo_write(album_dir, info)
-    return url
+    with bunkrinfo_lock:
+        info = _bunkrinfo_read(album_dir)
+        files = info.get("files", {})
+        url = files.pop(filename, None)
+        if url is not None:
+            info["files"] = files
+            _bunkrinfo_write(album_dir, info)
+        return url
 
 
 def update_bunkrinfo_add(album_dir, filename, url):
@@ -366,11 +376,12 @@ def update_bunkrinfo_add(album_dir, filename, url):
         url: Source URL associated with the file
     
     Note:
-        This function should be called within a bunkrinfo_lock context.
+        This function now handles locking internally for thread safety.
     """
-    info = _bunkrinfo_read(album_dir)
-    info.setdefault("files", {})[filename] = url
-    _bunkrinfo_write(album_dir, info)
+    with bunkrinfo_lock:
+        info = _bunkrinfo_read(album_dir)
+        info.setdefault("files", {})[filename] = url
+        _bunkrinfo_write(album_dir, info)
 
 
 def update_bunkrinfo_batch_remove(album_dir, filenames):
@@ -385,22 +396,23 @@ def update_bunkrinfo_batch_remove(album_dir, filenames):
         Dictionary mapping filename to URL for removed files
     
     Note:
-        This function should be called within a bunkrinfo_lock context.
+        This function now handles locking internally for thread safety.
     """
-    info = _bunkrinfo_read(album_dir)
-    files = info.get("files", {})
-    removed_urls = {}
-    
-    for filename in filenames:
-        url = files.pop(filename, None)
-        if url is not None:
-            removed_urls[filename] = url
-    
-    if removed_urls:
-        info["files"] = files
-        _bunkrinfo_write(album_dir, info)
-    
-    return removed_urls
+    with bunkrinfo_lock:
+        info = _bunkrinfo_read(album_dir)
+        files = info.get("files", {})
+        removed_urls = {}
+        
+        for filename in filenames:
+            url = files.pop(filename, None)
+            if url is not None:
+                removed_urls[filename] = url
+        
+        if removed_urls:
+            info["files"] = files
+            _bunkrinfo_write(album_dir, info)
+        
+        return removed_urls
 
 
 def update_bunkrinfo_batch_add(album_dir, file_url_map):
@@ -412,20 +424,63 @@ def update_bunkrinfo_batch_add(album_dir, file_url_map):
         file_url_map: Dictionary mapping filename to URL
     
     Note:
-        This function should be called within a bunkrinfo_lock context.
+        This function now handles locking internally for thread safety.
     """
     if not file_url_map:
         return
     
-    info = _bunkrinfo_read(album_dir)
-    files = info.setdefault("files", {})
-    files.update(file_url_map)
-    info["files"] = files
-    _bunkrinfo_write(album_dir, info)
+    with bunkrinfo_lock:
+        info = _bunkrinfo_read(album_dir)
+        files = info.setdefault("files", {})
+        files.update(file_url_map)
+        info["files"] = files
+        _bunkrinfo_write(album_dir, info)
 
 
 def sanitize(name):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip()
+
+def validate_album_path(album_name):
+    """
+    Validate album name to prevent path traversal attacks.
+    
+    Args:
+        album_name: The album name to validate
+    
+    Returns:
+        True if valid, False otherwise
+    
+    Raises:
+        ValueError: If the album name contains path traversal sequences
+    """
+    if not album_name or not isinstance(album_name, str):
+        raise ValueError("Album name must be a non-empty string")
+    
+    # Check for path traversal sequences
+    if ".." in album_name or "/" in album_name or "\\" in album_name:
+        raise ValueError("Album name contains invalid path traversal sequences")
+    
+    # Check for absolute paths
+    if album_name.startswith(("/", "\\")):
+        raise ValueError("Album name cannot be an absolute path")
+    
+    # Resolve the path and ensure it's within DOWNLOADS_DIR
+    try:
+        album_path = (DOWNLOADS_DIR / album_name).resolve()
+        downloads_path = DOWNLOADS_DIR.resolve()
+        
+        # Check if the resolved path is within DOWNLOADS_DIR
+        if not str(album_path).startswith(str(downloads_path)):
+            raise ValueError("Album path resolves outside of downloads directory")
+        
+        # Check for symlinks
+        if album_path.is_symlink():
+            raise ValueError("Album path is a symlink")
+            
+    except Exception as e:
+        raise ValueError(f"Invalid album path: {e}")
+    
+    return True
 
 def unique_album_dir(album_name, album_url):
     base = sanitize(album_name) or "bunkr_album"
@@ -503,7 +558,8 @@ def resolve_download_step_response(url, session, extra_headers=None, stream=Fals
     link = extract_media_from_html(html, url, session)
     if link and link != url:
         return session.get(link, headers=headers, timeout=(15, 30), allow_redirects=True, stream=stream)
-    raise RuntimeError("Bunkr download step returned an HTML page without a usable download form or media link")
+    # Return None instead of raising exception to allow graceful error handling
+    return None
 
 def format_size(num_bytes):
     if num_bytes is None:
@@ -1380,30 +1436,48 @@ def worker(job_id, task_queue, session, semaphore, worker_idx):
 
 
 def _ensure_global_pools(concurrency_images, concurrency_videos):
-    """Initialize or resize global thread pools based on user settings."""
-    global global_image_pool, global_video_pool
-    
+    """Initialize or resize the resolver pool and per-type download semaphores.
+
+    The resolver pool is sized to image_threads + video_threads so that URL
+    resolution always has enough threads to stay ahead of the download queues.
+    Once a file type is known, the worker acquires the appropriate semaphore
+    before starting the download, releasing it when finished.  This gives exact
+    per-type concurrency without nested pool submissions (no deadlock risk).
+    """
+    global global_resolver_pool, global_image_semaphore, global_video_semaphore
+    global _current_image_threads, _current_video_threads
+
+    total_workers = concurrency_images + concurrency_videos
+
     with global_pool_lock:
-        # Initialize or resize image pool
-        if global_image_pool is None:
-            global_image_pool = ThreadPoolExecutor(max_workers=concurrency_images, thread_name_prefix="ImagePool")
-            print(f"  [GlobalPool] Created image pool with {concurrency_images} threads")
-        elif global_image_pool._max_workers != concurrency_images:
-            # Resize by shutting down and recreating (ThreadPoolExecutor doesn't support dynamic resizing)
-            old_size = global_image_pool._max_workers
-            global_image_pool.shutdown(wait=False)
-            global_image_pool = ThreadPoolExecutor(max_workers=concurrency_images, thread_name_prefix="ImagePool")
-            print(f"  [GlobalPool] Resized image pool from {old_size} to {concurrency_images} threads")
-        
-        # Initialize or resize video pool
-        if global_video_pool is None:
-            global_video_pool = ThreadPoolExecutor(max_workers=concurrency_videos, thread_name_prefix="VideoPool")
-            print(f"  [GlobalPool] Created video pool with {concurrency_videos} threads")
-        elif global_video_pool._max_workers != concurrency_videos:
-            old_size = global_video_pool._max_workers
-            global_video_pool.shutdown(wait=False)
-            global_video_pool = ThreadPoolExecutor(max_workers=concurrency_videos, thread_name_prefix="VideoPool")
-            print(f"  [GlobalPool] Resized video pool from {old_size} to {concurrency_videos} threads")
+        # ── Resolver pool ──────────────────────────────────────────────────────
+        if global_resolver_pool is None:
+            global_resolver_pool = ThreadPoolExecutor(
+                max_workers=total_workers, thread_name_prefix="ResolverPool"
+            )
+            print(f"  [GlobalPool] Created resolver pool with {total_workers} threads "
+                  f"({concurrency_images} image + {concurrency_videos} video/zip)")
+        elif _current_image_threads + _current_video_threads != total_workers:
+            old_total = _current_image_threads + _current_video_threads
+            global_resolver_pool.shutdown(wait=False)
+            global_resolver_pool = ThreadPoolExecutor(
+                max_workers=total_workers, thread_name_prefix="ResolverPool"
+            )
+            print(f"  [GlobalPool] Resized resolver pool {old_total} → {total_workers} threads "
+                  f"({concurrency_images} image + {concurrency_videos} video/zip)")
+
+        # ── Image semaphore ────────────────────────────────────────────────────
+        if global_image_semaphore is None or _current_image_threads != concurrency_images:
+            global_image_semaphore = threading.Semaphore(concurrency_images)
+            print(f"  [GlobalPool] Image semaphore: {concurrency_images} concurrent download(s)")
+
+        # ── Video/zip semaphore ────────────────────────────────────────────────
+        if global_video_semaphore is None or _current_video_threads != concurrency_videos:
+            global_video_semaphore = threading.Semaphore(concurrency_videos)
+            print(f"  [GlobalPool] Video/zip semaphore: {concurrency_videos} concurrent download(s)")
+
+        _current_image_threads = concurrency_images
+        _current_video_threads = concurrency_videos
 
 
 def _process_task_with_pool_selection(job_id, task, session):
@@ -1436,9 +1510,14 @@ def _process_task_with_pool_selection(job_id, task, session):
     # Determine file type
     ext = get_ext(direct_url) or ".bin"
     file_type = "zip" if ext in ZIP_EXTS else ("image" if ext in IMAGE_EXTS else "video")
-    
-    # Download directly (no nested pool submission to avoid deadlock)
-    return _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type)
+
+    # Acquire the per-type semaphore to enforce independent concurrency limits.
+    # Images use global_image_semaphore; videos and zips use global_video_semaphore.
+    # Holding a reference at this point is safe: if settings change mid-job the
+    # old semaphore is simply released by its holders and the new one takes over.
+    sem = global_image_semaphore if file_type == "image" else global_video_semaphore
+    with sem:
+        return _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type)
 
 
 def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type):
@@ -1675,7 +1754,7 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
     futures = []
     for idx, page_url in enumerate(file_pages, 1):
         task = (idx, page_url, out_dir, folder_album_name, len(file_pages))
-        future = global_video_pool.submit(_process_task_with_pool_selection, job_id, task, session)
+        future = global_resolver_pool.submit(_process_task_with_pool_selection, job_id, task, session)
         futures.append(future)
     
     # Wait for all tasks to complete
@@ -1823,7 +1902,7 @@ def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
         out_dir = Path(ft["out_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
         task = (i, ft["page_url"], out_dir, ft["album_name"], len(failed_tasks))
-        future = global_video_pool.submit(_process_task_with_pool_selection, job_id, task, session)
+        future = global_resolver_pool.submit(_process_task_with_pool_selection, job_id, task, session)
         futures.append(future)
 
     # Wait for all tasks to complete
@@ -2119,19 +2198,25 @@ def job_status(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
     result = dict(job)
+    full_log = result["log"]
+    result["log_total"] = len(full_log)
+    log_since = request.args.get("log_since", type=int)
+    if log_since is not None and log_since >= 0:
+        result["log"] = full_log[log_since:]
     result["total_speed"] = sum(job["file_speeds"].values())
     result["total_downloaded"] = sum(p.get("downloaded", 0) for p in job["file_progress"].values())
     result["ffmpeg_ok"] = FFMPEG_OK
     result["playwright_ok"] = PLAYWRIGHT_OK
     result["failed_count"] = len(job.get("failed_tasks", []))
-    result["diagnostic_meta"] = {
-        "app": f"BunkrWrap Web UI v{VERSION}",
-        "python": sys.version.split()[0],
-        "platform": sys.platform,
-        "cwd": str(Path.cwd()),
-        "downloads_dir": str(DOWNLOADS_DIR.resolve()),
-        "thumbnails_dir": str(THUMBS_DIR.resolve()),
-    }
+    if request.args.get("diag"):
+        result["diagnostic_meta"] = {
+            "app": f"BunkrWrap Web UI v{VERSION}",
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "cwd": str(Path.cwd()),
+            "downloads_dir": str(DOWNLOADS_DIR.resolve()),
+            "thumbnails_dir": str(THUMBS_DIR.resolve()),
+        }
     return jsonify(result)
 
 
@@ -2259,6 +2344,25 @@ def list_albums():
     return jsonify(result)
 
 
+@app.route("/api/albums/mtime")
+def albums_mtime():
+    """Return the max mtime across DOWNLOADS_DIR and its immediate subdirs.
+    Used by the frontend for fast change detection without a full gallery fetch."""
+    try:
+        if not DOWNLOADS_DIR.exists():
+            return jsonify({"mtime": 0})
+        mt = DOWNLOADS_DIR.stat().st_mtime
+        for d in DOWNLOADS_DIR.iterdir():
+            if d.is_dir():
+                try:
+                    mt = max(mt, d.stat().st_mtime)
+                except OSError:
+                    pass
+        return jsonify({"mtime": mt})
+    except Exception:
+        return jsonify({"mtime": 0})
+
+
 @app.route("/api/album/create", methods=["POST"])
 def album_create():
     data   = request.get_json(silent=True) or {}
@@ -2266,7 +2370,20 @@ def album_create():
     parent = (data.get("parent") or "").strip()
     if not name:
         return jsonify({"error": "Name required"}), 400
+    
+    # Validate album name
+    try:
+        validate_album_path(name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     if parent:
+        # Validate parent album name
+        try:
+            validate_album_path(parent)
+        except ValueError as e:
+            return jsonify({"error": f"Invalid parent: {e}"}), 400
+            
         parent_path = DOWNLOADS_DIR / parent
         if not parent_path.is_dir():
             return jsonify({"error": "Parent album not found"}), 404
@@ -2288,6 +2405,14 @@ def album_nest():
     dst_album = (data.get("target") or "").strip()
     if not src_album or not dst_album:
         return jsonify({"error": "source and target required"}), 400
+    
+    # Validate both album names
+    try:
+        validate_album_path(src_album)
+        validate_album_path(dst_album)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     src_path   = DOWNLOADS_DIR / src_album
     dst_parent = DOWNLOADS_DIR / dst_album
     dst_path   = dst_parent / src_album
@@ -2320,19 +2445,49 @@ def album_rename():
     new_raw = (data.get("new_name") or "").strip()
     if not old or not new_raw:
         return jsonify({"error": "old_name and new_name required"}), 400
+    
+    # Validate old album name
+    try:
+        validate_album_path(old)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     new = sanitize(new_raw)
     if not new:
         return jsonify({"error": "Invalid new name"}), 400
+    
+    # Validate new album name
+    try:
+        validate_album_path(new)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     src = DOWNLOADS_DIR / old
     dst = DOWNLOADS_DIR / new
     if not src.is_dir():
         return jsonify({"error": "Album not found"}), 404
     if dst.exists():
         return jsonify({"error": "Name already taken"}), 409
-    src.rename(dst)
+    
+    # Rename album directory
+    try:
+        src.rename(dst)
+    except Exception as e:
+        return jsonify({"error": f"Failed to rename album: {e}"}), 500
+    
+    # Rename thumbnails directory if present
     tsrc = THUMBS_DIR / old
     if tsrc.exists():
-        tsrc.rename(THUMBS_DIR / new)
+        try:
+            tsrc.rename(THUMBS_DIR / new)
+        except Exception as e:
+            # Rollback album rename if thumbnail rename fails
+            try:
+                dst.rename(src)
+            except Exception:
+                pass
+            return jsonify({"error": f"Failed to rename thumbnails: {e}"}), 500
+    
     return jsonify({"ok": True, "new_name": new})
 
 
@@ -2342,6 +2497,12 @@ def album_delete():
     album_name = (data.get("album_name") or "").strip()
     if not album_name:
         return jsonify({"error": "album_name required"}), 400
+    
+    # Validate album path to prevent directory traversal
+    try:
+        validate_album_path(album_name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     
     album_dir = DOWNLOADS_DIR / album_name
     if not album_dir.exists():
@@ -2359,6 +2520,135 @@ def album_delete():
         shutil.rmtree(thumb_dir)
     
     return jsonify({"ok": True, "deleted_files": file_count})
+
+
+@app.route("/api/albums/merge", methods=["POST"])
+def albums_merge():
+    """
+    Task 6.3: Merge multiple albums into a target album
+    Requirements 2.4.2, 2.4.3, 2.4.4, 3.3.1
+    """
+    data = request.get_json(silent=True) or {}
+    source_albums = data.get("sourceAlbums", [])
+    target_album_name = (data.get("targetAlbumName") or "").strip()
+    
+    if not source_albums or not isinstance(source_albums, list):
+        return jsonify({"success": False, "error": "sourceAlbums array required"}), 400
+    
+    if not target_album_name:
+        return jsonify({"success": False, "error": "targetAlbumName required"}), 400
+    
+    # Validate all album names
+    try:
+        for album_name in source_albums:
+            validate_album_path(album_name)
+        validate_album_path(target_album_name)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    
+    # Check that source albums exist
+    for album_name in source_albums:
+        album_dir = DOWNLOADS_DIR / album_name
+        if not album_dir.exists():
+            return jsonify({"success": False, "error": f"Source album not found: {album_name}"}), 404
+    
+    # Create target album directory if it doesn't exist
+    target_dir = DOWNLOADS_DIR / target_album_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create target thumbnails directory
+    target_thumb_dir = THUMBS_DIR / target_album_name
+    target_thumb_dir.mkdir(parents=True, exist_ok=True)
+    
+    files_moved = 0
+    errors = []
+    
+    # Task 6.4: Handle duplicate filenames during merge
+    def resolve_filename_conflict(target_dir, filename):
+        """Generate unique filename if conflict exists"""
+        if not (target_dir / filename).exists():
+            return filename
+        
+        # Split filename and extension
+        stem = Path(filename).stem
+        ext = Path(filename).suffix
+        
+        # Try numbered suffixes until we find a unique name
+        counter = 1
+        while True:
+            new_filename = f"{stem}_{counter}{ext}"
+            if not (target_dir / new_filename).exists():
+                return new_filename
+            counter += 1
+    
+    # Merge each source album
+    for source_album in source_albums:
+        source_dir = DOWNLOADS_DIR / source_album
+        source_thumb_dir = THUMBS_DIR / source_album
+        
+        try:
+            # Move all files from source to target
+            for file_path in source_dir.iterdir():
+                if file_path.is_file() and file_path.name != ".bunkrinfo":
+                    # Task 6.4: Resolve filename conflicts
+                    target_filename = resolve_filename_conflict(target_dir, file_path.name)
+                    target_path = target_dir / target_filename
+                    
+                    # Move file
+                    shutil.move(str(file_path), str(target_path))
+                    files_moved += 1
+                    
+                    # Move thumbnail if exists
+                    thumb_name = file_path.stem + ".jpg"
+                    source_thumb = source_thumb_dir / thumb_name
+                    if source_thumb.exists():
+                        target_thumb_name = Path(target_filename).stem + ".jpg"
+                        target_thumb = target_thumb_dir / target_thumb_name
+                        shutil.move(str(source_thumb), str(target_thumb))
+            
+            # Merge .bunkrinfo metadata
+            source_info = _bunkrinfo_read(source_dir)
+            target_info = _bunkrinfo_read(target_dir)
+            
+            # Merge file mappings
+            if "files" in source_info:
+                target_files = target_info.setdefault("files", {})
+                for filename, url in source_info["files"].items():
+                    # Use resolved filename if there was a conflict
+                    resolved_name = resolve_filename_conflict(target_dir, filename)
+                    target_files[resolved_name] = url
+                target_info["files"] = target_files
+            
+            # Preserve album_url if target doesn't have one
+            if "album_url" in source_info and "album_url" not in target_info:
+                target_info["album_url"] = source_info["album_url"]
+            
+            _bunkrinfo_write(target_dir, target_info)
+            
+            # Delete source album directory
+            shutil.rmtree(source_dir)
+            
+            # Delete source thumbnails directory
+            if source_thumb_dir.exists():
+                shutil.rmtree(source_thumb_dir)
+                
+        except Exception as e:
+            errors.append({"album": source_album, "error": str(e)})
+    
+    if errors:
+        return jsonify({
+            "success": False,
+            "targetAlbum": target_album_name,
+            "filesMoved": files_moved,
+            "errors": errors
+        }), 500
+    
+    return jsonify({
+        "success": True,
+        "targetAlbum": target_album_name,
+        "filesMoved": files_moved,
+        "errors": []
+    })
 
 
 @app.route("/api/album/move-file", methods=["POST"])
@@ -2560,9 +2850,8 @@ def move_files_batch():
                     print(f"  [Warning] Failed to move video thumbnail for {filename}: {e}")
             
             # Task 22.3: Collect metadata changes for batched updates
-            # Read the URL from source album metadata (will be batched later)
-            with bunkrinfo_lock:
-                src_url = update_bunkrinfo_remove(DOWNLOADS_DIR / src_album, filename)
+            # Read the URL from source album metadata
+            src_url = update_bunkrinfo_remove(DOWNLOADS_DIR / src_album, filename)
             
             # Track successful move for batched metadata update
             if src_url is not None:
@@ -2600,9 +2889,8 @@ def move_files_batch():
             print(f"  [Error] Unexpected error moving {src_album}/{filename}: {e}")
     
     # Task 22.3: Apply batched metadata updates (single write per album)
-    with bunkrinfo_lock:
-        for album, file_url_map in metadata_adds.items():
-            update_bunkrinfo_batch_add(DOWNLOADS_DIR / album, file_url_map)
+    for album, file_url_map in metadata_adds.items():
+        update_bunkrinfo_batch_add(DOWNLOADS_DIR / album, file_url_map)
     
     return jsonify({
         "success": success,
@@ -2686,17 +2974,36 @@ def delete_single_file():
     if not album or not filename:
         return jsonify({"error": "Missing album or filename"}), 400
     
+    # Validate album path to prevent directory traversal
+    try:
+        validate_album_path(album)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
+    # Additional validation for filename to prevent path traversal
+    if ".." in filename or "/" in filename or "\\" in filename:
+        return jsonify({"error": "Invalid filename"}), 400
+    
     file_path = DOWNLOADS_DIR / album / filename
     thumb_path = THUMBS_DIR / album / (Path(filename).stem + "_thumb.jpg")
     video_thumb_path = THUMBS_DIR / album / (Path(filename).stem + ".jpg")
     
     try:
+        # Delete main file first
         if file_path.exists():
             file_path.unlink()
+        else:
+            return jsonify({"error": "File not found"}), 404
+        
+        # Only delete thumbnails if main file deletion succeeded
         if thumb_path.exists():
             thumb_path.unlink()
         if video_thumb_path.exists():
             video_thumb_path.unlink()
+        
+        # Update metadata
+        update_bunkrinfo_remove(DOWNLOADS_DIR / album, filename)
+        
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
