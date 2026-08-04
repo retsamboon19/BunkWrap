@@ -1,27 +1,35 @@
-# BunkrWrap v3.1.0
+# BunkrWrap V5
 
-BunkrWrap is a local web app for downloading and organizing Bunkr albums. It includes parallel downloads, previews, automatic image and video thumbnails, archive extraction, download history, and gallery management.
+BunkrWrap V5 is a local web app for downloading and organizing Bunkr albums. It includes parallel downloads, previews, automatic image and video thumbnails, archive extraction, download history, and gallery management.
 
-## One-click setup (Windows 10/11)
+## New one-click installation (Windows 10/11)
 
-1. Click **Code → Download ZIP** on this GitHub page.
-2. Extract the ZIP to a normal folder.
-3. Double-click **`Install BunkrWrap.bat`**.
+No command line or previous Python installation is required.
 
-The setup installs everything into the BunkrWrap folder and creates a desktop shortcut. It includes:
+1. **[Download BunkrWrap V5](https://github.com/retsamboon19/BunkWrap/archive/refs/heads/main.zip)**.
+2. Open the downloaded ZIP and choose **Extract all**.
+3. Open the extracted `BunkWrap-main` folder.
+4. Double-click **`Install BunkrWrap.bat`**.
+5. Wait for **Setup complete**. BunkrWrap will open automatically and a desktop shortcut will be created.
 
-- an isolated Python environment and all required packages;
+The new installer automatically downloads and configures every dependency and feature:
+
+- Python and an isolated BunkrWrap environment;
+- all required Python packages;
 - Chromium for JavaScript-heavy Bunkr pages;
 - FFmpeg and FFprobe for video thumbnails;
-- 7-Zip command-line tools for RAR and 7z extraction.
+- 7-Zip tools for RAR and 7z extraction;
+- a **BunkrWrap** desktop shortcut.
 
-The first setup can take several minutes and needs an internet connection. Windows may ask whether PowerShell or Python can access the network. After setup, use the **BunkrWrap** desktop shortcut or double-click `start_server.bat`.
+The first installation can take several minutes and requires an internet connection. If Windows asks for network access, allow Python and PowerShell. Setup is safe to run again if it is interrupted.
+
+After installation, open BunkrWrap using the desktop shortcut or by double-clicking `start_server.bat`.
 
 > BunkrWrap runs only on your computer at `http://127.0.0.1:5000`. It does not include analytics or upload your files.
 
 ## Updating
 
-Download the newest ZIP, extract it over the existing BunkrWrap folder, and run **`Install BunkrWrap.bat`** again. Your `Downloads`, `Thumbnails`, and download history are kept.
+Download the newest V5 ZIP, extract it over the existing BunkrWrap folder, and run **`Install BunkrWrap.bat`** again. The installer updates or repairs the dependencies without removing your `Downloads`, `Thumbnails`, or download history.
 
 ## Manual setup (advanced users)
 
