@@ -27,6 +27,28 @@ After installation, open BunkrWrap using the desktop shortcut or by double-click
 
 > BunkrWrap runs only on your computer at `http://127.0.0.1:5000`. It does not include analytics or upload your files.
 
+### If Windows Smart App Control blocks the installer
+
+`Install BunkrWrap.bat` is an open-source batch file and is not digitally signed. Windows 11 Smart App Control may therefore show **“Smart App Control blocked a file that may be unsafe.”**
+
+First try unblocking only the downloaded ZIP:
+
+1. Delete the folder you already extracted.
+2. Right-click the downloaded `BunkWrap-main.zip` and select **Properties**.
+3. On the **General** tab, select **Unblock**, then **Apply** and **OK**.
+4. Extract the ZIP again and run `Install BunkrWrap.bat`.
+
+Only unblock files downloaded from this official repository. You can scan the ZIP with Microsoft Defender before continuing.
+
+If Smart App Control still blocks the installer, you may need to temporarily disable it:
+
+1. Open **Windows Security**.
+2. Select **App & browser control**.
+3. Select **Smart App Control settings**.
+4. Set Smart App Control to **Off**, then run `Install BunkrWrap.bat` again.
+
+Disabling Smart App Control reduces Windows protection against unknown applications. Re-enable it after installation if your Windows version offers that option. Microsoft does not currently provide a per-app exception for Smart App Control. See [Microsoft's Smart App Control FAQ](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-frequently-asked-questions) for current details.
+
 ## Updating
 
 Download the newest V5 ZIP, extract it over the existing BunkrWrap folder, and run **`Install BunkrWrap.bat`** again. The installer updates or repairs the dependencies without removing your `Downloads`, `Thumbnails`, or download history.
