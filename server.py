@@ -22,6 +22,7 @@ import subprocess
 import math
 import base64
 import html
+import random
 import zipfile
 import tarfile
 from pathlib import Path
@@ -90,7 +91,7 @@ class AlbumNotFoundError(FileOperationError):
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-VERSION = "3.1.0"
+VERSION = "5.0.1"
 
 DOWNLOADS_DIR = Path("./Downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -122,10 +123,12 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | ZIP_EXTS
 
 DEFAULT_CONCURRENCY_IMAGES = 5
 DEFAULT_CONCURRENCY_VIDEOS = 2
+MAX_CONCURRENCY_IMAGES = 8
+MAX_CONCURRENCY_VIDEOS = 4
 CHUNK_SIZE = 1024 * 512  # 512 KB
 
 BASE_RETRY_DELAY = 2
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 6
 PLAYWRIGHT_GOTO_TIMEOUT_MS = 15000
 PLAYWRIGHT_SELECTOR_TIMEOUT_MS = 5000
 
@@ -158,6 +161,78 @@ global_video_semaphore = None  # threading.Semaphore(video_threads)
 _current_image_threads = 0
 _current_video_threads = 0
 global_pool_lock = threading.Lock()
+_session_local = threading.local()
+
+# Bunkr's CDN rate limits all files on the same host together.  Coordinate
+# request starts and cooldowns across every worker instead of letting each
+# thread retry independently and create a thundering herd.
+_cdn_lock = threading.Lock()
+_cdn_cooldown_until = {}
+_cdn_next_request_at = {}
+_cdn_rate_strikes = {}
+CDN_REQUEST_START_SPACING = 0.35
+CDN_MAX_COOLDOWN = 90
+
+
+def _thread_session():
+    session = getattr(_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _session_local.session = session
+    return session
+
+
+def _cdn_host(url):
+    return (urlparse(url).hostname or "").lower()
+
+
+def wait_for_cdn_slot(url, job=None, file_index=None):
+    """Stagger requests and honor a host-wide cooldown after throttling."""
+    host = _cdn_host(url)
+    if not host:
+        return
+    with _cdn_lock:
+        now = time.monotonic()
+        ready_at = max(
+            now,
+            _cdn_cooldown_until.get(host, 0),
+            _cdn_next_request_at.get(host, 0),
+        )
+        _cdn_next_request_at[host] = ready_at + CDN_REQUEST_START_SPACING
+    delay = max(0, ready_at - time.monotonic())
+    if delay > 0:
+        if job is not None and delay >= 2:
+            job["log"].append({
+                "type": "warn",
+                "msg": f"[{file_index}] CDN cooldown: waiting {math.ceil(delay)}s before resuming...",
+            })
+        time.sleep(delay)
+
+
+def register_cdn_throttle(url, retry_after=None, severe=False):
+    """Apply exponential, shared backoff for 429/503 and broken streams."""
+    host = _cdn_host(url)
+    if not host:
+        return 5
+    with _cdn_lock:
+        strikes = min(6, _cdn_rate_strikes.get(host, 0) + 1)
+        _cdn_rate_strikes[host] = strikes
+        base = 15 if severe else 5
+        calculated = min(CDN_MAX_COOLDOWN, base * (2 ** (strikes - 1)))
+        delay = max(float(retry_after or 0), calculated) + random.uniform(0.5, 2.0)
+        until = time.monotonic() + delay
+        _cdn_cooldown_until[host] = max(_cdn_cooldown_until.get(host, 0), until)
+    return math.ceil(delay)
+
+
+def register_cdn_success(url):
+    host = _cdn_host(url)
+    if not host:
+        return
+    with _cdn_lock:
+        strikes = _cdn_rate_strikes.get(host, 0)
+        if strikes > 0:
+            _cdn_rate_strikes[host] = strikes - 1
 
 # ─── Persistent browser pool ────────────────────────────────────────────────────
 POOL_SIZE = DEFAULT_CONCURRENCY_VIDEOS   # starts equal to video thread count
@@ -494,9 +569,31 @@ def unique_album_dir(album_name, album_url):
     base = sanitize(album_name) or "bunkr_album"
     album_id = urlparse(strip_page_param(album_url)).path.rstrip("/").split("/")[-1]
     suffix = sanitize(album_id)[:8] if album_id else uuid.uuid4().hex[:8]
+    normalized_url = strip_page_param(album_url).rstrip("/")
     candidate = DOWNLOADS_DIR / base
     if not candidate.exists():
         return base, candidate
+
+    # Re-running the same album is a repair/resume operation, not a new album.
+    # Reuse its directory so partial files continue from their current byte and
+    # completed files are skipped. Older builds always created a suffixed copy,
+    # which prevented recovery after restarting BunkrWrap.
+    existing_info = _bunkrinfo_read(candidate)
+    existing_url = strip_page_param(existing_info.get("url", "")).rstrip("/")
+    if existing_url and existing_url == normalized_url:
+        return base, candidate
+
+    # Also recover a prior suffixed attempt of this same album.
+    for existing_dir in DOWNLOADS_DIR.iterdir():
+        if not existing_dir.is_dir():
+            continue
+        if not existing_dir.name.startswith(f"{base} [{suffix}"):
+            continue
+        existing_info = _bunkrinfo_read(existing_dir)
+        existing_url = strip_page_param(existing_info.get("url", "")).rstrip("/")
+        if existing_url and existing_url == normalized_url:
+            return existing_dir.name, existing_dir
+
     unique_name = f"{base} [{suffix}]"
     candidate = DOWNLOADS_DIR / unique_name
     n = 2
@@ -1255,30 +1352,67 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
     if max_retries is None:
         max_retries = DEFAULT_MAX_RETRIES
 
-    for attempt in range(max_retries):
+    attempt = 0
+    rate_limit_events = 0
+    max_rate_limit_events = 3
+
+    while attempt < max_retries:
         try:
+            wait_for_cdn_slot(url, job, file_index)
             existing_size = dest.stat().st_size if dest.exists() else 0
             dl_headers = {**HEADERS, "Referer": "https://bunkr.cr/"}
             if existing_size > 0:
                 dl_headers["Range"] = f"bytes={existing_size}-"
 
-            with session.get(url, headers=dl_headers, stream=True, timeout=60) as r:
+            with session.get(url, headers=dl_headers, stream=True, timeout=(20, 90)) as r:
                 # Handle rate limiting
                 if r.status_code == 429:
-                    retry_after = int(r.headers.get('Retry-After', 5))
-                    job["log"].append({"type": "warn", "msg": f"[{file_index}] Rate limited, waiting {retry_after}s..."})
-                    time.sleep(retry_after)
-                    continue  # Retry without counting as failed attempt
+                    retry_header = r.headers.get("Retry-After")
+                    retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
+                    delay = register_cdn_throttle(url, retry_after, severe=True)
+                    rate_limit_events += 1
+                    job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rate limit (429); all downloads cooling down for {delay}s..."})
+                    if rate_limit_events >= max_rate_limit_events:
+                        job["log"].append({"type": "error", "msg": f"[{file_index}] CDN repeatedly rejected this file; leaving it for Retry Failed."})
+                        return False
+                    continue
                 
                 # Handle server errors
                 if r.status_code == 503:
-                    job["log"].append({"type": "warn", "msg": f"[{file_index}] Server unavailable, retrying..."})
-                    time.sleep(exponential_backoff(attempt))
+                    delay = register_cdn_throttle(url, severe=False)
+                    job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN unavailable (503); cooling down for {delay}s..."})
+                    attempt += 1
                     continue
                 
                 if r.status_code == 416:
-                    return True
+                    content_range = r.headers.get("Content-Range", "")
+                    match = re.search(r"\*/(\d+)$", content_range)
+                    remote_size = int(match.group(1)) if match else preflight_size(url, session)
+                    if remote_size and existing_size >= remote_size:
+                        register_cdn_success(url)
+                        return True
+                    job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rejected the resume offset; keeping the partial file and retrying."})
+                    register_cdn_throttle(url, severe=False)
+                    attempt += 1
+                    continue
                 r.raise_for_status()
+
+                # A resumed request must return a matching 206 response. If the
+                # CDN ignores Range and returns 200, overwrite instead of appending
+                # a second full copy and silently corrupting the file.
+                if existing_size > 0 and r.status_code == 206:
+                    content_range = r.headers.get("Content-Range", "")
+                    expected_prefix = f"bytes {existing_size}-"
+                    if not content_range.lower().startswith(expected_prefix.lower()):
+                        job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN returned a mismatched resume range; restarting file safely."})
+                        if dest.exists():
+                            dest.unlink()
+                        attempt += 1
+                        continue
+                elif existing_size > 0 and r.status_code == 200:
+                    job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN ignored resume request; restarting file safely."})
+                    existing_size = 0
+
                 total_from_header = r.headers.get("content-length")
                 total_size = (int(total_from_header) + existing_size) if total_from_header else None
                 speed_window = deque(maxlen=10)
@@ -1306,10 +1440,11 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                         f.write(chunk)
                         downloaded += len(chunk)
                         now = time.monotonic()
-                        speed_window.append((now, len(chunk)))
+                        speed_window.append((now, downloaded))
                         if len(speed_window) >= 2:
                             elapsed = speed_window[-1][0] - speed_window[0][0]
-                            speed_bps = sum(b for _, b in speed_window) / elapsed if elapsed > 0 else 0
+                            bytes_in_window = speed_window[-1][1] - speed_window[0][1]
+                            speed_bps = bytes_in_window / elapsed if elapsed > 0 else 0
                         else:
                             speed_bps = 0
                         with jobs_lock:
@@ -1317,27 +1452,48 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                             job["file_progress"][file_index] = {
                                 "downloaded": downloaded, "total": total_size, "speed": speed_bps,
                             }
+                if total_size is not None and downloaded < total_size:
+                    raise requests.exceptions.ChunkedEncodingError(
+                        f"response ended at {downloaded} of {total_size} bytes"
+                    )
                 # Small delay after successful download to reduce rate limiting
-                time.sleep(0.3)
+                register_cdn_success(url)
+                time.sleep(0.5)
                 return True
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
-                retry_after = int(e.response.headers.get('Retry-After', 5))
-                job["log"].append({"type": "warn", "msg": f"[{file_index}] Rate limited, waiting {retry_after}s..."})
-                time.sleep(retry_after)
-                continue  # Don't count as failed attempt
+                retry_header = e.response.headers.get("Retry-After")
+                retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
+                delay = register_cdn_throttle(url, retry_after, severe=True)
+                rate_limit_events += 1
+                job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rate limit (429); all downloads cooling down for {delay}s..."})
+                if rate_limit_events >= max_rate_limit_events:
+                    job["log"].append({"type": "error", "msg": f"[{file_index}] CDN repeatedly rejected this file; leaving it for Retry Failed."})
+                    return False
+                continue
             elif e.response.status_code == 503:
-                job["log"].append({"type": "warn", "msg": f"[{file_index}] Server unavailable (503), retry {attempt+1}/{max_retries}"})
-                time.sleep(exponential_backoff(attempt))
+                delay = register_cdn_throttle(url, severe=False)
+                attempt += 1
+                job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN unavailable (503), retry {attempt}/{max_retries} after {delay}s"})
             else:
-                print(f"  [Download] HTTP {e.response.status_code} attempt {attempt+1}: {e}")
-                job["log"].append({"type": "warn", "msg": f"[{file_index}] HTTP {e.response.status_code} attempt {attempt+1}/{max_retries}"})
-                time.sleep(exponential_backoff(attempt))
+                attempt += 1
+                print(f"  [Download] HTTP {e.response.status_code} attempt {attempt}: {e}")
+                job["log"].append({"type": "warn", "msg": f"[{file_index}] HTTP {e.response.status_code} attempt {attempt}/{max_retries}"})
+                time.sleep(exponential_backoff(attempt - 1))
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout) as e:
+            attempt += 1
+            delay = register_cdn_throttle(url, severe=False)
+            partial_size = dest.stat().st_size if dest.exists() else 0
+            print(f"  [Download] Interrupted attempt {attempt}: {e}")
+            job["log"].append({"type": "warn", "msg": f"[{file_index}] Connection interrupted at {format_size(partial_size)}; resume {attempt}/{max_retries} after {delay}s"})
         except Exception as e:
-            print(f"  [Download] Attempt {attempt+1} failed: {e}")
-            job["log"].append({"type": "warn", "msg": f"[{file_index}] attempt {attempt+1}/{max_retries} failed: {e}"})
-            time.sleep(exponential_backoff(attempt))
+            attempt += 1
+            print(f"  [Download] Attempt {attempt} failed: {e}")
+            job["log"].append({"type": "warn", "msg": f"[{file_index}] attempt {attempt}/{max_retries} failed: {e}"})
+            time.sleep(exponential_backoff(attempt - 1))
             if dest.exists() and dest.stat().st_size == 0:
                 dest.unlink()
 
@@ -1627,6 +1783,9 @@ def _ensure_global_pools(concurrency_images, concurrency_videos):
 def _process_task_with_pool_selection(job_id, task, session):
     """Process a task by first resolving the URL to determine file type, then downloading directly."""
     idx, page_url, out_dir, album_name, total = task
+    # requests.Session is not guaranteed to be safe when mutated concurrently.
+    # Reuse one session per resolver thread instead of sharing a single job session.
+    session = _thread_session()
     job = jobs[job_id]
     max_retries = job.get("max_retries", DEFAULT_MAX_RETRIES)
     
@@ -2245,8 +2404,8 @@ def start_download():
     data = request.json
     url = (data.get("url") or "").strip()
     only_file = (data.get("only_file") or "").strip()
-    concurrency_images = max(1, min(20, int(data.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))))
-    concurrency_videos = max(1, min(20, int(data.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))))
+    concurrency_images = max(1, min(MAX_CONCURRENCY_IMAGES, int(data.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))))
+    concurrency_videos = max(1, min(MAX_CONCURRENCY_VIDEOS, int(data.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))))
     max_retries = max(1, min(10, int(data.get("max_retries", DEFAULT_MAX_RETRIES))))
 
     if not url or "bunkr" not in url:
@@ -2281,9 +2440,9 @@ def retry_failed(job_id):
         return jsonify({"error": "No failed files to retry"}), 400
 
     data = request.get_json() or {}
-    concurrency_images = int(data.get("concurrency_images") or original_job.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))
-    concurrency_videos = int(data.get("concurrency_videos") or original_job.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))
-    max_retries = int(data.get("max_retries") or original_job.get("max_retries", DEFAULT_MAX_RETRIES))
+    concurrency_images = max(1, min(MAX_CONCURRENCY_IMAGES, int(data.get("concurrency_images") or original_job.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))))
+    concurrency_videos = max(1, min(MAX_CONCURRENCY_VIDEOS, int(data.get("concurrency_videos") or original_job.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))))
+    max_retries = max(1, min(10, int(data.get("max_retries") or original_job.get("max_retries", DEFAULT_MAX_RETRIES))))
     new_job_id = str(uuid.uuid4())[:8]
     jobs[new_job_id] = {
         "status": "running", "url": original_job["url"],
@@ -2314,9 +2473,9 @@ def retry_one(job_id):
     task = next((t for t in failed_tasks if str(t["idx"]) == target_idx), None)
     if not task:
         return jsonify({"error": "Task not found in failed list"}), 404
-    concurrency_images = int(data.get("concurrency_images") or original_job.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))
-    concurrency_videos = int(data.get("concurrency_videos") or original_job.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))
-    max_retries  = int(data.get("max_retries") or original_job.get("max_retries", DEFAULT_MAX_RETRIES))
+    concurrency_images = max(1, min(MAX_CONCURRENCY_IMAGES, int(data.get("concurrency_images") or original_job.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES))))
+    concurrency_videos = max(1, min(MAX_CONCURRENCY_VIDEOS, int(data.get("concurrency_videos") or original_job.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS))))
+    max_retries = max(1, min(10, int(data.get("max_retries") or original_job.get("max_retries", DEFAULT_MAX_RETRIES))))
     new_job_id = str(uuid.uuid4())[:8]
     jobs[new_job_id] = {
         "status": "running", "url": original_job.get("url", ""),
@@ -3697,7 +3856,7 @@ def index():
 
 if __name__ == "__main__":
     print("\n  ╔══════════════════════════════════════════╗")
-    print("  ║   BunkrWrap  Web UI  v2                  ║")
+    print(f"  ║   BunkrWrap  Web UI  v{VERSION:<18}║")
     print("  ║   http://localhost:5000                  ║")
     print(f"  ║   Playwright : {'✓ ready' if PLAYWRIGHT_OK else '✗ not installed'}                   ║")
     print(f"  ║   ffmpeg     : {'✓ ready' if FFMPEG_OK else '✗ not found (no video thumbs)'}         ║")

@@ -1700,17 +1700,17 @@
     <div id="tab-settings" style="display:none; padding:14px 16px; flex-direction:column; gap:16px; overflow-y:auto;">
       <div class="setting-group">
         <div class="setting-label">IMAGE THREADS <span class="range-val" id="imgThreadsVal">5</span></div>
-        <input type="range" id="imgThreads" min="1" max="15" value="5"
+        <input type="range" id="imgThreads" min="1" max="8" value="5"
           oninput="onImgThreadsChange(this.value)">
       </div>
       <div class="setting-group">
         <div class="setting-label">VIDEO/ZIP THREADS <span class="range-val" id="vidThreadsVal">2</span></div>
-        <input type="range" id="vidThreads" min="1" max="10" value="2"
+        <input type="range" id="vidThreads" min="1" max="4" value="2"
           oninput="onVidThreadsChange(this.value)">
       </div>
       <div class="setting-group">
-        <div class="setting-label">RETRIES <span class="range-val" id="retriesVal">3</span></div>
-        <input type="range" id="retriesRange" min="1" max="10" value="3"
+        <div class="setting-label">RETRIES <span class="range-val" id="retriesVal">6</span></div>
+        <input type="range" id="retriesRange" min="1" max="10" value="6"
           oninput="document.getElementById('retriesVal').textContent = this.value">
       </div>
       <div class="setting-group">
@@ -1739,8 +1739,8 @@
       <div style="border-top:1px solid var(--border);padding-top:12px;">
         <label>ABOUT</label>
         <div style="font-family:var(--mono);font-size:0.65rem;color:var(--muted);line-height:1.9;margin-top:6px;">
-          BunkrWrap v2<br>
-          • Multi-threaded downloads (up to 20)<br>
+          BunkrWrap V5<br>
+          • Throttle-aware multi-threaded downloads<br>
           • Resume interrupted downloads<br>
           • Real-time speed graph<br>
           • Video thumbnails via ffmpeg<br>
@@ -3111,7 +3111,7 @@ async function init() {
     }
     const defImgThreads = cfg.default_concurrency_images || 5;
     const defVidThreads = cfg.default_concurrency_videos || 2;
-    const defRetries = cfg.default_max_retries || 3;
+    const defRetries = cfg.default_max_retries || 6;
     document.getElementById('imgThreads').value = defImgThreads;
     document.getElementById('imgThreadsVal').textContent = defImgThreads;
     document.getElementById('vidThreads').value = defVidThreads;
@@ -3413,7 +3413,7 @@ async function downloadPreviewFile(idx) {
   const f = files[idx];
   const concurrency_images = parseInt(document.getElementById('imgThreads').value) || 5;
   const concurrency_videos = parseInt(document.getElementById('vidThreads').value) || 2;
-  const max_retries = parseInt(document.getElementById('retriesRange').value) || 3;
+  const max_retries = parseInt(document.getElementById('retriesRange').value) || 6;
 
   const albumUrl = document.getElementById('urlInput').value.trim().split('\n')[0].trim();
   // Prefer the file's Bunkr page URL so the server gets a single-file album scrape,
@@ -3548,7 +3548,7 @@ async function retryFailed() {
   if (!activeJobId) return;
   const concurrency_images = parseInt(document.getElementById('imgThreads').value) || 5;
   const concurrency_videos = parseInt(document.getElementById('vidThreads').value) || 2;
-  const max_retries = parseInt(document.getElementById('retriesRange').value) || 3;
+  const max_retries = parseInt(document.getElementById('retriesRange').value) || 6;
   const res = await fetch(`/api/job/${activeJobId}/retry_failed`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -4209,7 +4209,7 @@ async function retryOneFile(jobId, idx) {
   try {
     const concurrency_images = parseInt(document.getElementById('imgThreads').value) || 5;
     const concurrency_videos = parseInt(document.getElementById('vidThreads').value) || 2;
-    const max_retries = parseInt(document.getElementById('retriesRange').value) || 3;
+    const max_retries = parseInt(document.getElementById('retriesRange').value) || 6;
     const res  = await fetch(`/api/job/${jobId}/retry_one`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
