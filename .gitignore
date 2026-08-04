@@ -1,0 +1,16 @@
+# BunkrWrap user data
+/Downloads/
+/Thumbnails/
+/.bunkrwrap_history.json
+
+# One-click installer output
+/.venv/
+/tools/
+/.install-complete
+
+# Python/editor files
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+

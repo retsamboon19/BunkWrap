@@ -4,9 +4,9 @@ BunkrWrap Server v2 — Flask backend for the web UI
 Run: python server.py
 Then open: http://localhost:5000
 
-Requires: pip install flask requests beautifulsoup4 playwright
+Requires: pip install flask requests beautifulsoup4 pillow playwright
           playwright install chromium
-Optional:  ffmpeg in PATH (for video thumbnail generation)
+Optional:  ffmpeg/ffprobe and 7-Zip in tools/ or PATH
 """
 
 import re
@@ -38,9 +38,17 @@ try:
 except ImportError:
     PLAYWRIGHT_OK = False
 
-FFMPEG_OK = shutil.which("ffmpeg") is not None
+_BUNDLED_FFMPEG_DIR = Path(__file__).resolve().parent / "tools" / "ffmpeg"
+_BUNDLED_FFMPEG = _BUNDLED_FFMPEG_DIR / "ffmpeg.exe"
+_BUNDLED_FFPROBE = _BUNDLED_FFMPEG_DIR / "ffprobe.exe"
+FFMPEG_CMD = str(_BUNDLED_FFMPEG) if _BUNDLED_FFMPEG.is_file() else (shutil.which("ffmpeg") or "ffmpeg")
+FFPROBE_CMD = str(_BUNDLED_FFPROBE) if _BUNDLED_FFPROBE.is_file() else (shutil.which("ffprobe") or "ffprobe")
+FFMPEG_OK = Path(FFMPEG_CMD).is_file() and Path(FFPROBE_CMD).is_file()
 
 def _find_7zip():
+    bundled = Path(__file__).resolve().parent / "tools" / "7zip" / "7za.exe"
+    if bundled.is_file():
+        return str(bundled)
     for cmd in ("7z", "7za", "7zz"):
         p = shutil.which(cmd)
         if p:
@@ -519,7 +527,9 @@ def is_thumbnail(url):
 def is_bunkr_download_step(url):
     parsed = urlparse(url)
     host = parsed.hostname or ""
-    return bool(re.search(r'(^|\.)get\.bunkr+r?\.su$', host, re.I) and re.search(r'^/file/\d+', parsed.path))
+    old_step = re.search(r'(^|\.)get\.bunkr+r?\.su$', host, re.I)
+    current_step = host.lower() == "dl.bunkr.cr"
+    return bool((old_step or current_step) and re.search(r'^/file/\d+', parsed.path))
 
 def filename_from_page_html(html):
     if not html:
@@ -898,6 +908,128 @@ def resolve_bunkr_api(slug, session):
     except Exception:
         return None
 
+
+def _sign_bunkr_cdn_url(raw_url, sign_url, page_url, session):
+    """Add the token/ex parameters required by Bunkr's current CDN."""
+    try:
+        raw_parsed = urlparse(raw_url)
+        sign_parsed = urlparse(sign_url)
+        if raw_parsed.scheme not in ("http", "https") or not raw_parsed.netloc:
+            return None
+        if sign_parsed.scheme != "https" or not sign_parsed.netloc:
+            return None
+
+        r = session.get(
+            sign_url,
+            params={"path": unquote(raw_parsed.path)},
+            headers={**HEADERS, "Referer": page_url or "https://bunkr.cr/"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        token = data.get("token")
+        expires = data.get("ex")
+        if not token or expires is None:
+            return None
+
+        query = parse_qs(raw_parsed.query, keep_blank_values=True)
+        query["token"] = [str(token)]
+        query["ex"] = [str(expires)]
+        return urlunparse(raw_parsed._replace(query=urlencode(query, doseq=True)))
+    except (ValueError, TypeError, requests.RequestException):
+        return None
+
+
+def resolve_bunkr_signed_media(html, page_url, session):
+    """Resolve Bunkr's current jsCDN + signing-endpoint delivery flow."""
+    if not html:
+        return None
+
+    cdn_match = re.search(
+        r'\b(?:var|let|const)\s+jsCDN\s*=\s*("(?:\\.|[^"\\])*")',
+        html,
+        re.I,
+    )
+    sign_match = re.search(
+        r'\b(?:var|let|const)\s+signUrl\s*=\s*("(?:\\.|[^"\\])*")',
+        html,
+        re.I,
+    )
+    if not cdn_match or not sign_match:
+        return None
+
+    try:
+        # json.loads correctly decodes JavaScript's escaped forward slashes.
+        raw_url = json.loads(cdn_match.group(1))
+        sign_url = json.loads(sign_match.group(1))
+    except (ValueError, TypeError):
+        return None
+    return _sign_bunkr_cdn_url(raw_url, sign_url, page_url, session)
+
+
+def resolve_bunkr_download_link(html, page_url, session):
+    """Resolve files that Bunkr serves through its dl.bunkr.cr metadata page."""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    download_url = None
+    for anchor in soup.find_all("a", href=True):
+        candidate = urljoin(page_url, anchor["href"])
+        if is_bunkr_download_step(candidate):
+            download_url = candidate
+            break
+    if not download_url:
+        return None
+
+    try:
+        r = session.get(
+            download_url,
+            headers={**HEADERS, "Referer": page_url},
+            timeout=15,
+        )
+        r.raise_for_status()
+        step_html = r.text
+        step_soup = BeautifulSoup(step_html, "html.parser")
+        button = step_soup.find(id="download-btn")
+        file_id = button.get("data-id") if button else None
+        if not file_id:
+            file_id = urlparse(download_url).path.rstrip("/").split("/")[-1]
+        if not str(file_id).isdigit():
+            return None
+
+        step_parsed = urlparse(download_url)
+        api_url = urlunparse(step_parsed._replace(path="/api/_001_v2", params="", query="", fragment=""))
+        meta_response = session.post(
+            api_url,
+            json={"id": str(file_id)},
+            headers={**HEADERS, "Referer": download_url},
+            timeout=15,
+        )
+        meta_response.raise_for_status()
+        meta = meta_response.json()
+        media_base = meta.get("mediafiles")
+        media_path = meta.get("path")
+        if not media_base or not media_path:
+            return None
+        raw_url = urljoin(media_base.rstrip("/") + "/", str(media_path).lstrip("/"))
+        original = meta.get("original")
+        if original:
+            parsed = urlparse(raw_url)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            query["n"] = [str(original)]
+            raw_url = urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+        sign_match = re.search(
+            r"\bSIGN_SERVICE_URL\s*=\s*['\"](https://[^'\"]+)['\"]",
+            step_html,
+            re.I,
+        )
+        sign_url = sign_match.group(1) if sign_match else "https://glb-apisign.cdn.cr/sign"
+        return _sign_bunkr_cdn_url(raw_url, sign_url, download_url, session)
+    except (ValueError, TypeError, requests.RequestException):
+        return None
+
+
 def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playwright=True, return_reason=False):
     """Resolve a file-page URL to a direct download URL. Handles archives specially.
 
@@ -921,6 +1053,18 @@ def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playw
         if issue:
             job_log.append({"type": "error", "msg": f"  {issue}"})
             return (None, issue) if return_reason else None
+
+        # Current Bunkr pages expose an escaped jsCDN URL and a separate signing
+        # endpoint.  The resulting token/ex query parameters are required by the CDN.
+        signed_result = resolve_bunkr_signed_media(html, page_url, session)
+        if signed_result:
+            job_log.append({"type": "info", "msg": f"  Resolved via signed CDN: {slug}"})
+            return (signed_result, None) if return_reason else signed_result
+
+        download_result = resolve_bunkr_download_link(html, page_url, session)
+        if download_result:
+            job_log.append({"type": "info", "msg": f"  Resolved via download page: {slug}"})
+            return (download_result, None) if return_reason else download_result
 
         # Check if this is an archive page
         soup = BeautifulSoup(html, "html.parser")
@@ -1083,7 +1227,7 @@ def generate_video_thumbnail(video_path, album_name):
         if thumb_path.exists() and thumb_path.stat().st_mtime >= video_path.stat().st_mtime:
             return f"/thumbs/{album_name}/{thumb_path.name}"
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE_CMD, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
             capture_output=True, text=True, timeout=15
         )
@@ -1092,7 +1236,7 @@ def generate_video_thumbnail(video_path, album_name):
         # Use scale and crop to create a square thumbnail that fills the entire space
         # First scale to ensure one dimension is THUMB_MAX_SIZE, then crop to square
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(seek), "-i", str(video_path),
+            [FFMPEG_CMD, "-y", "-ss", str(seek), "-i", str(video_path),
              "-vframes", "1", "-q:v", "3", 
              "-vf", f"scale={THUMB_MAX_SIZE}:{THUMB_MAX_SIZE}:force_original_aspect_ratio=increase,crop={THUMB_MAX_SIZE}:{THUMB_MAX_SIZE}", 
              str(thumb_path)],

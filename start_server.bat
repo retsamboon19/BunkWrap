@@ -1,16 +1,17 @@
 @echo off
-title BunkrWrap Server
+setlocal
+cd /d "%~dp0"
+title BunkrWrap Launcher
 
-echo Stopping any process running on port 5000...
-for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr /R ":5000 "') do (
-    taskkill /F /PID %%a >nul 2>&1
+if not exist ".venv\Scripts\python.exe" (
+    echo BunkrWrap needs to finish its one-time setup first.
+    call "%~dp0Install BunkrWrap.bat"
+    exit /b %errorlevel%
 )
-timeout /t 1 /nobreak >nul
 
-echo Starting BunkrWrap server...
-start "" python server.py
-timeout /t 2 /nobreak >nul
+set "PLAYWRIGHT_BROWSERS_PATH=%~dp0tools\playwright"
+echo Starting BunkrWrap...
+start "BunkrWrap Server" /min "%~dp0.venv\Scripts\python.exe" "%~dp0server.py"
+timeout /t 3 /nobreak >nul
 start "" "http://127.0.0.1:5000"
-echo Server running at http://127.0.0.1:5000
-echo Close this window to stop the server.
-pause
+echo BunkrWrap is open in your browser.
