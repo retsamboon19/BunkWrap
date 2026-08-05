@@ -33,6 +33,16 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, Response
 
+# Windows launchers can inherit a legacy console code page (for example
+# cp1252).  Status messages contain Unicode symbols, so make logging lossy-safe
+# instead of letting an unencodable banner prevent the web server from starting.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_OK = True
@@ -100,6 +110,7 @@ THUMBS_DIR = Path("./Thumbnails")
 THUMBS_DIR.mkdir(exist_ok=True)
 
 HISTORY_FILE = Path("./.bunkrwrap_history.json")
+JOBS_FILE = Path("./.bunkrwrap_jobs.json")
 
 # Thumbnail cache settings
 THUMB_MAX_SIZE = 300  # Max dimension for thumbnails
@@ -150,6 +161,125 @@ CDN_HOSTS = re.compile(
 jobs = {}
 jobs_lock = threading.Lock()
 bunkrinfo_lock = threading.Lock()
+
+PERSISTED_JOB_KEYS = (
+    "status", "url", "album_name", "total", "done", "success", "failed",
+    "skipped", "log", "files", "failed_tasks", "pause_requested", "paused",
+    "concurrency_images", "concurrency_videos", "max_retries", "only_file",
+    "created_at",
+)
+
+
+def persist_jobs():
+    """Atomically save the queue so an app restart cannot lose unfinished work."""
+    with jobs_lock:
+        records = []
+        for job_id, job in jobs.items():
+            record = {"job_id": job_id}
+            for key in PERSISTED_JOB_KEYS:
+                if key in job:
+                    record[key] = job[key]
+            records.append(record)
+    try:
+        temp_path = JOBS_FILE.with_suffix(JOBS_FILE.suffix + ".tmp")
+        temp_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        temp_path.replace(JOBS_FILE)
+    except Exception as exc:
+        print(f"  [Queue] Could not save download queue: {exc}")
+
+
+def _restored_job(record):
+    """Build safe in-memory state from one persisted queue record."""
+    # Older/current runs could mark a temporary album-page connection failure
+    # terminal before discovering any files. Keep those entries resumable.
+    discovery_failed = record.get("status") == "failed" and not record.get("total")
+    if discovery_failed:
+        record = dict(record)
+        record["status"] = "running"
+        record["pause_requested"] = True
+        record["paused"] = True
+        record.setdefault("log", []).append({
+            "type": "warn",
+            "msg": "Album connection failed — kept paused in the queue. Press Resume to retry later.",
+        })
+    was_paused = bool(record.get("pause_requested") or record.get("paused"))
+    was_running = record.get("status") == "running" and not was_paused
+    job = {
+        "status": record.get("status", "paused"),
+        "url": record.get("url", ""),
+        "album_name": record.get("album_name", ""),
+        "total": record.get("total", 0), "current": 0,
+        "done": record.get("done", 0),
+        "success": record.get("success", 0),
+        "failed": record.get("failed", 0),
+        "skipped": record.get("skipped", 0),
+        "log": list(record.get("log", []))[-1000:],
+        "files": list(record.get("files", [])),
+        "file_progress": {}, "file_speeds": {}, "file_sizes": {},
+        "failed_tasks": list(record.get("failed_tasks", [])),
+        "pause_requested": bool(record.get("pause_requested", False)),
+        "paused": bool(record.get("paused", False)),
+        "stop_requested": False,
+        "concurrency_images": record.get("concurrency_images", DEFAULT_CONCURRENCY_IMAGES),
+        "concurrency_videos": record.get("concurrency_videos", DEFAULT_CONCURRENCY_VIDEOS),
+        "max_retries": record.get("max_retries", DEFAULT_MAX_RETRIES),
+        "only_file": record.get("only_file"),
+        "zip_folders": [],
+        "created_at": record.get("created_at", time.time()),
+        "_runner_active": False,
+        "_auto_resume": was_running,
+    }
+    if was_running:
+        # The album is safely replayed: completed files are skipped and partial
+        # files resume by byte range. Counts belong to this new execution pass.
+        job.update(done=0, success=0, failed=0, skipped=0, failed_tasks=[], files=[])
+        job["log"].append({
+            "type": "warn",
+            "msg": "App restarted — unfinished download returned to the queue and will resume partial files.",
+        })
+    return job
+
+
+def load_persisted_jobs():
+    if not JOBS_FILE.exists():
+        return []
+    try:
+        records = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(records, list):
+            return []
+    except Exception as exc:
+        print(f"  [Queue] Could not load saved download queue: {exc}")
+        return []
+    resumable = []
+    with jobs_lock:
+        for record in records:
+            job_id = record.get("job_id")
+            if not job_id or not record.get("url"):
+                continue
+            job = _restored_job(record)
+            jobs[job_id] = job
+            if job.pop("_auto_resume", False):
+                resumable.append(job_id)
+    return resumable
+
+
+def start_queued_job(job_id):
+    """Start/restart a persisted album job exactly once in this process."""
+    job = jobs.get(job_id)
+    if not job or job.get("_runner_active"):
+        return False
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["paused"] = False
+    job["stop_requested"] = False
+    job["_runner_active"] = True
+    threading.Thread(
+        target=run_job,
+        args=(job_id, job["url"], job["concurrency_images"], job["concurrency_videos"]),
+        daemon=True,
+    ).start()
+    persist_jobs()
+    return True
 
 # ─── Global Thread Pools ───────────────────────────────────────────────────────
 # Single resolver pool handles all URL resolutions concurrently.
@@ -1405,6 +1535,10 @@ def generate_video_thumbnail(video_path, album_name):
 
 # ─── Downloader ────────────────────────────────────────────────────────────────
 
+class DownloadPaused(Exception):
+    """Internal signal to reopen the same file with a Range request."""
+
+
 def download_file(url, dest, session, job, file_index, max_retries=None, adaptive_gate=None):
     if max_retries is None:
         max_retries = DEFAULT_MAX_RETRIES
@@ -1490,7 +1624,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                             f.close()
                             if dest.exists() and dest.stat().st_size == 0:
                                 dest.unlink()
-                            return False  # Return False to indicate incomplete download
+                            raise DownloadPaused()
                         
                         if not chunk:
                             continue
@@ -1518,6 +1652,18 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                 time.sleep(0.5)
                 return True
 
+        except DownloadPaused:
+            job["paused"] = True
+            persist_jobs()
+            while job.get("pause_requested") and not job.get("stop_requested"):
+                time.sleep(0.25)
+            job["paused"] = False
+            if job.get("stop_requested"):
+                return False
+            job["log"].append({"type": "info", "msg": f"[{file_index}] Resuming partial file: {dest.name}"})
+            # Do not consume a retry. The next loop re-reads the partial size
+            # and sends a Range request for the remaining bytes.
+            continue
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 retry_header = e.response.headers.get("Retry-After")
@@ -2067,6 +2213,7 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
 
 def run_job(job_id, album_url, concurrency_images, concurrency_videos):
     job = jobs[job_id]
+    job["_runner_active"] = True
     session = requests.Session()
 
     # Ensure global pools are initialized with current settings
@@ -2084,7 +2231,15 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
 
     if not file_pages:
         job["log"].append({"type": "error", "msg": "No files found in album."})
-        job["status"] = "failed"
+        job["log"].append({
+            "type": "warn",
+            "msg": "Album was not reachable — kept paused in the queue. Press Resume to retry later.",
+        })
+        job["status"] = "running"
+        job["pause_requested"] = True
+        job["paused"] = True
+        job["_runner_active"] = False
+        persist_jobs()
         return
 
     only = job.get("only_file")
@@ -2094,6 +2249,8 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
         if not file_pages:
             job["log"].append({"type": "error", "msg": f'No file matched "{only}" in this album.'})
             job["status"] = "failed"
+            job["_runner_active"] = False
+            persist_jobs()
             return
         job["log"].append({"type": "info", "msg": f"Downloading 1 file ({only}) — {before_n} total in album"})
 
@@ -2103,10 +2260,18 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
 
     job["album_name"] = folder_album_name
     job["total"] = len(file_pages)
+    persist_jobs()
     job["log"].append({"type": "info", "msg": f'Album: "{folder_album_name}" — {len(file_pages)} file(s) in this job'})
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / ".bunkrinfo").write_text(json.dumps({"url": album_url}), encoding="utf-8")
+    # Keep completion metadata from an earlier/interrupted attempt.  Replacing
+    # this file here made a resumed album forget every file that had already
+    # been verified, which in turn made an incomplete album hard to diagnose.
+    with bunkrinfo_lock:
+        existing_info = _bunkrinfo_read(out_dir)
+        existing_info["url"] = album_url
+        existing_info.setdefault("files", {})
+        _bunkrinfo_write(out_dir, existing_info)
 
     free_bytes = get_free_disk_bytes()
     if free_bytes is not None:
@@ -2141,6 +2306,8 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
         job["status"] = "done"
         job["paused"] = False
         job["pause_requested"] = False
+        job["_runner_active"] = False
+        persist_jobs()
         return
 
     # If only 1 zip was downloaded in this album, flatten its subfolder to the album root
@@ -2183,6 +2350,8 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
     job["status"] = "done"
     job["paused"] = False
     job["pause_requested"] = False
+    job["_runner_active"] = False
+    persist_jobs()
 
     # Generate thumbnails for downloaded files (recurses into zip subfolders for multi-zip albums)
     def generate_thumbs_bg():
@@ -2253,6 +2422,7 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
 
 def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
     job = jobs[job_id]
+    job["_runner_active"] = True
     session = requests.Session()
     
     # Ensure global pools are initialized with current settings
@@ -2296,12 +2466,16 @@ def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
         job["status"] = "done"
         job["paused"] = False
         job["pause_requested"] = False
+        job["_runner_active"] = False
+        persist_jobs()
         return
 
     job["log"].append({"type": "ok", "msg": f"Retry done — ✓ {job.get('success',0)} downloaded, ✗ {job.get('failed',0)} still failed, ↷ {job.get('skipped',0)} skipped"})
     job["status"] = "done"
     job["paused"] = False
     job["pause_requested"] = False
+    job["_runner_active"] = False
+    persist_jobs()
 
 # ─── Preview incremental sizes (background + SSE) ────────────────────────────
 
@@ -2474,6 +2648,16 @@ def start_download():
     if not url or "bunkr" not in url:
         return jsonify({"error": "Invalid Bunkr URL"}), 400
 
+    normalized_url = strip_page_param(url).rstrip("/")
+    with jobs_lock:
+        existing_job_id = next((
+            existing_id for existing_id, existing_job in jobs.items()
+            if existing_job.get("status") == "running"
+            and strip_page_param(existing_job.get("url", "")).rstrip("/") == normalized_url
+        ), None)
+    if existing_job_id:
+        return jsonify({"job_id": existing_job_id, "existing": True})
+
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {
         "status": "running", "url": url, "album_name": "",
@@ -2488,8 +2672,10 @@ def start_download():
         "max_retries": max_retries,
         "only_file": only_file or None,
         "zip_folders": [],
+        "created_at": time.time(),
+        "_runner_active": False,
     }
-    threading.Thread(target=run_job, args=(job_id, url, concurrency_images, concurrency_videos), daemon=True).start()
+    start_queued_job(job_id)
     return jsonify({"job_id": job_id})
 
 
@@ -2519,9 +2705,12 @@ def retry_failed(job_id):
         "concurrency_images": concurrency_images,
         "concurrency_videos": concurrency_videos,
         "max_retries": max_retries,
+        "created_at": time.time(),
+        "_runner_active": True,
     }
     original_job["failed_tasks"] = []
     threading.Thread(target=run_retry_job, args=(new_job_id, failed_tasks, concurrency_images, concurrency_videos), daemon=True).start()
+    persist_jobs()
     return jsonify({"job_id": new_job_id})
 
 
@@ -2552,10 +2741,31 @@ def retry_one(job_id):
         "concurrency_images": concurrency_images,
         "concurrency_videos": concurrency_videos,
         "max_retries": max_retries,
+        "created_at": time.time(),
+        "_runner_active": True,
     }
     original_job["failed_tasks"] = [t for t in failed_tasks if str(t["idx"]) != target_idx]
     threading.Thread(target=run_retry_job, args=(new_job_id, [task], concurrency_images, concurrency_videos), daemon=True).start()
+    persist_jobs()
     return jsonify({"job_id": new_job_id})
+
+
+@app.route("/api/jobs")
+def list_jobs():
+    """Return enough server-side job state to rebuild the UI after a reload."""
+    with jobs_lock:
+        result = [
+            {
+                "job_id": job_id,
+                "url": job.get("url", ""),
+                "album_name": job.get("album_name", ""),
+                "status": job.get("status", "running"),
+                "created_at": job.get("created_at", 0),
+            }
+            for job_id, job in jobs.items()
+        ]
+    result.sort(key=lambda item: item["created_at"])
+    return jsonify(result)
 
 
 @app.route("/api/job/<job_id>")
@@ -2592,6 +2802,7 @@ def pause_job(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
     job["pause_requested"] = True
+    persist_jobs()
     return jsonify({"ok": True})
 
 
@@ -2600,8 +2811,14 @@ def resume_job(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    job["pause_requested"] = False
-    job["paused"] = False
+    if not job.get("_runner_active") and job.get("status") in {"paused", "running"}:
+        job.update(done=0, success=0, failed=0, skipped=0, failed_tasks=[], files=[])
+        job["log"].append({"type": "info", "msg": "Resuming saved queue item and partial files..."})
+        start_queued_job(job_id)
+    else:
+        job["pause_requested"] = False
+        job["paused"] = False
+        persist_jobs()
     return jsonify({"ok": True})
 
 
@@ -2615,6 +2832,7 @@ def stop_job(job_id):
     job["paused"] = False
     job["status"] = "done"
     job["log"].append({"type": "warn", "msg": f"⏹ Stopped by user — ✓ {job.get('success',0)} downloaded so far"})
+    persist_jobs()
     return jsonify({"ok": True})
 
 
@@ -3918,6 +4136,8 @@ def index():
 
 
 if __name__ == "__main__":
+    resumable_job_ids = load_persisted_jobs()
+    persist_jobs()  # Save any queue-state migration performed while loading.
     print("\n  ╔══════════════════════════════════════════╗")
     print(f"  ║   BunkrWrap  Web UI  v{VERSION:<18}║")
     print("  ║   http://localhost:5000                  ║")
@@ -3930,4 +4150,6 @@ if __name__ == "__main__":
             target=browser_pool.start, args=(POOL_SIZE,),
             daemon=True, name="BrowserPool"
         ).start()
+    for queued_job_id in resumable_job_ids:
+        start_queued_job(queued_job_id)
     app.run(debug=False, port=5000, threaded=True)

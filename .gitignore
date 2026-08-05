@@ -2,6 +2,8 @@
 /Downloads/
 /Thumbnails/
 /.bunkrwrap_history.json
+/.bunkrwrap_jobs.json
+/.bunkrwrap_jobs.json.tmp
 
 # One-click installer output
 /.venv/
@@ -13,4 +15,3 @@ __pycache__/
 *.py[cod]
 .idea/
 .vscode/
-

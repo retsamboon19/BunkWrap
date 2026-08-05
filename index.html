@@ -3099,6 +3099,10 @@ async function init() {
   updatePoolDots();
   setInterval(updatePoolDots, 1500);
 
+  // Downloads live on the server, not in this browser tab. Rebuild their
+  // cards so closing/reopening or refreshing the page never hides a session.
+  await restoreDownloadJobs();
+
   try {
     const cfg = await fetch('/api/config').then(r => r.json());
     document.getElementById('ffmpegStatus').textContent = cfg.ffmpeg_ok ? '✓' : '✗';
@@ -3597,6 +3601,7 @@ function clearDoneJobs() {
 // Job card
 // ──────────────────────────────────────────────────────────────────────────────
 function addJobCard(jobId, url) {
+  if (document.getElementById(`job-${jobId}`)) return;
   const list = document.getElementById('jobsList');
   const noJob = list.querySelector('.no-job');
   if (noJob) noJob.remove();
@@ -3617,6 +3622,26 @@ function addJobCard(jobId, url) {
   list.appendChild(div);
   ensurePolling();
   pollAllJobs();
+}
+
+async function restoreDownloadJobs() {
+  let serverJobs;
+  try {
+    const response = await fetch('/api/jobs', { cache: 'no-store' });
+    if (!response.ok) return;
+    serverJobs = await response.json();
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(serverJobs) || !serverJobs.length) return;
+
+  serverJobs.forEach(job => addJobCard(job.job_id, job.url || job.album_name || job.job_id));
+
+  const remembered = localStorage.getItem('bunkrwrapActiveJobId');
+  const rememberedExists = serverJobs.some(job => job.job_id === remembered);
+  const running = [...serverJobs].reverse().find(job => job.status === 'running');
+  const selected = rememberedExists ? remembered : (running?.job_id || serverJobs[serverJobs.length - 1].job_id);
+  if (selected) selectJob(selected);
 }
 
 function ensurePolling() {
@@ -3861,6 +3886,7 @@ function saveJobLog() {
 // ──────────────────────────────────────────────────────────────────────────────
 function selectJob(jobId) {
   activeJobId = jobId;
+  localStorage.setItem('bunkrwrapActiveJobId', jobId);
   document.querySelectorAll('.job-card').forEach(c => c.classList.remove('active'));
   const card = document.getElementById(`job-${jobId}`);
   if (card) card.classList.add('active');

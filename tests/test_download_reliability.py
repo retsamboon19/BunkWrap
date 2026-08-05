@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import io
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -159,15 +161,141 @@ class DownloadReliabilityTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(self.dest.read_bytes(), b"abcdefgh")
 
+    def test_pause_keeps_partial_file_queued_and_resumes_same_file(self):
+        job = make_job()
+
+        class PausingResponse(FakeResponse):
+            def iter_content(self, _chunk_size):
+                yield b"abcd"
+                job["pause_requested"] = True
+                yield b"ignored"
+
+        session = FakeSession([
+            PausingResponse(200, {"Content-Length": "8"}),
+            FakeResponse(206, {
+                "Content-Length": "4",
+                "Content-Range": "bytes 4-7/8",
+            }, [b"efgh"]),
+        ])
+
+        with patch.object(server, "persist_jobs"), \
+             patch.object(server.time, "sleep", side_effect=lambda _seconds: job.update(pause_requested=False)):
+            ok = server.download_file(
+                "https://cdn.example/video.mp4", self.dest, session,
+                job, "5", max_retries=1,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(self.dest.read_bytes(), b"abcdefgh")
+        self.assertEqual(session.request_headers[1]["Range"], "bytes=4-")
+        self.assertTrue(any("Resuming partial file" in item["msg"] for item in job["log"]))
+
 
 class JobSafetyTests(unittest.TestCase):
+    def test_same_active_album_reuses_queue_item_instead_of_duplicate_writers(self):
+        job_id = "already1"
+        server.jobs[job_id] = {
+            "status": "running", "url": "https://bunkr.cr/a/same",
+        }
+        try:
+            with patch.object(server, "start_queued_job") as start:
+                response = server.app.test_client().post("/api/download", json={
+                    "url": "https://bunkr.cr/a/same/",
+                })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json(), {"job_id": job_id, "existing": True})
+            start.assert_not_called()
+        finally:
+            server.jobs.pop(job_id, None)
+
+    def test_running_queue_item_survives_restart_and_is_marked_for_resume(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue_file = Path(root) / "jobs.json"
+            job_id = "persist1"
+            server.jobs[job_id] = {
+                "status": "running", "url": "https://bunkr.cr/a/persist",
+                "album_name": "Persistent Album", "total": 4, "done": 1,
+                "success": 0, "failed": 0, "skipped": 0, "log": [],
+                "files": [], "failed_tasks": [], "pause_requested": False,
+                "paused": False, "concurrency_images": 2,
+                "concurrency_videos": 3, "max_retries": 6,
+                "only_file": None, "created_at": 123.0,
+            }
+            try:
+                with patch.object(server, "JOBS_FILE", queue_file):
+                    server.persist_jobs()
+                    server.jobs.clear()
+                    resumable = server.load_persisted_jobs()
+                self.assertEqual(resumable, [job_id])
+                self.assertEqual(server.jobs[job_id]["done"], 0)
+                self.assertFalse(server.jobs[job_id]["_runner_active"])
+            finally:
+                server.jobs.pop(job_id, None)
+
+    def test_paused_queue_item_stays_paused_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue_file = Path(root) / "jobs.json"
+            queue_file.write_text(json.dumps([{
+                "job_id": "paused01", "status": "running",
+                "url": "https://bunkr.cr/a/paused",
+                "pause_requested": True, "paused": True,
+            }]), encoding="utf-8")
+            try:
+                with patch.object(server, "JOBS_FILE", queue_file):
+                    resumable = server.load_persisted_jobs()
+                self.assertEqual(resumable, [])
+                self.assertTrue(server.jobs["paused01"]["pause_requested"])
+            finally:
+                server.jobs.pop("paused01", None)
+
+    def test_album_discovery_failure_remains_resumable_in_queue(self):
+        restored = server._restored_job({
+            "status": "failed", "url": "https://bunkr.cr/a/offline",
+            "total": 0, "log": [],
+        })
+
+        self.assertEqual(restored["status"], "running")
+        self.assertTrue(restored["pause_requested"])
+        self.assertTrue(restored["paused"])
+        self.assertFalse(restored["_auto_resume"])
+
+    def test_console_output_is_configured_to_replace_unencodable_symbols(self):
+        # The Windows launcher may use cp1252; Unicode status glyphs must not
+        # be able to crash the server before Flask starts listening.
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="replace")
+        stream.write("BunkrWrap ✓ → ready")
+        stream.flush()
+
+    def test_jobs_api_lists_server_jobs_for_browser_reload(self):
+        job_id = "reload01"
+        server.jobs[job_id] = {
+            "url": "https://bunkr.cr/a/reload",
+            "album_name": "Reload Album",
+            "status": "running",
+            "created_at": 123.0,
+        }
+        try:
+            response = server.app.test_client().get("/api/jobs")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn({
+                "job_id": job_id,
+                "url": "https://bunkr.cr/a/reload",
+                "album_name": "Reload Album",
+                "status": "running",
+                "created_at": 123.0,
+            }, response.get_json())
+        finally:
+            server.jobs.pop(job_id, None)
+
     def test_api_clamps_unsafe_concurrency_and_uses_safer_retries(self):
-        with patch.object(server.threading, "Thread") as thread:
-            response = server.app.test_client().post("/api/download", json={
-                "url": "https://bunkr.cr/a/example",
-                "concurrency_images": 15,
-                "concurrency_videos": 99,
-            })
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(server, "JOBS_FILE", Path(root) / "jobs.json"), \
+                 patch.object(server.threading, "Thread") as thread:
+                response = server.app.test_client().post("/api/download", json={
+                    "url": "https://bunkr.cr/a/example",
+                    "concurrency_images": 15,
+                    "concurrency_videos": 99,
+                })
         self.assertEqual(response.status_code, 200)
         job_id = response.get_json()["job_id"]
         try:
