@@ -2,6 +2,12 @@
 
 BunkrWrap V5 is a local web app for downloading and organizing Bunkr albums. It includes parallel downloads, previews, automatic image and video thumbnails, archive extraction, download history, and gallery management.
 
+### V5.0.2: smarter 10-thread downloads
+
+Video and ZIP downloads now start with up to **10 workers**. If a CDN begins returning rate-limit errors or broken connections, BunkrWrap temporarily reduces active transfers, waits for the affected host, resumes partial files, and gradually returns to 10 after successful downloads. The 10-worker queue remains available throughout, so users do not need to keep changing the thread setting manually.
+
+No downloader can guarantee that a third-party CDN will provide full speed or accept 10 simultaneous transfers. BunkrWrap does not rotate IP addresses or use proxy networks to bypass server limits.
+
 ## New one-click installation (Windows 10/11)
 
 No command line or previous Python installation is required.
@@ -84,7 +90,7 @@ Double-click `stop_server_ps.bat`. You can start it again from the desktop short
 - **Setup stopped:** Check the internet connection, temporarily allow Python/PowerShell through security software, then run `Install BunkrWrap.bat` again. Setup is safe to repeat.
 - **Browser did not open:** Visit [http://127.0.0.1:5000](http://127.0.0.1:5000).
 - **Port 5000 is already in use:** Run `stop_server_ps.bat`, then start BunkrWrap again.
-- **A download cannot be resolved:** Confirm that the album works in a normal browser, lower the thread counts, and retry after a few minutes.
+- **A download cannot be resolved:** Confirm that the album works in a normal browser, wait a few minutes, then use **Retry Failed**. Partial files resume instead of restarting.
 - **Video thumbnails are missing:** Run `Install BunkrWrap.bat` again so FFmpeg can be repaired.
 - **RAR/7z extraction is unavailable:** Run the installer again and check that `tools/7zip/7za.exe` exists afterward.
 

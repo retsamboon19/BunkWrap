@@ -166,7 +166,7 @@ class JobSafetyTests(unittest.TestCase):
             response = server.app.test_client().post("/api/download", json={
                 "url": "https://bunkr.cr/a/example",
                 "concurrency_images": 15,
-                "concurrency_videos": 10,
+                "concurrency_videos": 99,
             })
         self.assertEqual(response.status_code, 200)
         job_id = response.get_json()["job_id"]
@@ -178,6 +178,14 @@ class JobSafetyTests(unittest.TestCase):
             thread.return_value.start.assert_called_once()
         finally:
             server.jobs.pop(job_id, None)
+
+    def test_config_exposes_ten_video_workers_by_default(self):
+        response = server.app.test_client().get("/api/config")
+
+        self.assertEqual(response.status_code, 200)
+        config = response.get_json()
+        self.assertEqual(config["version"], "5.0.2")
+        self.assertEqual(config["default_concurrency_videos"], 10)
 
     def test_same_album_directory_is_reused_for_resume(self):
         with tempfile.TemporaryDirectory() as root:
@@ -193,6 +201,33 @@ class JobSafetyTests(unittest.TestCase):
                 )
             self.assertEqual(name, "Example Album")
             self.assertEqual(path, album_dir)
+
+
+class AdaptiveDownloadGateTests(unittest.TestCase):
+    def test_gate_starts_at_ten_and_recovers_after_throttling(self):
+        gate = server.AdaptiveDownloadGate(10, recovery_successes=2)
+
+        self.assertEqual(gate.current_limit, 10)
+        self.assertEqual(gate.record_throttle(), 5)
+        self.assertEqual(gate.record_throttle(), 2)
+        self.assertEqual(gate.record_success(), 2)
+        self.assertEqual(gate.record_success(), 3)
+
+        for _ in range(20):
+            gate.record_success()
+        self.assertEqual(gate.current_limit, 10)
+
+    def test_throttle_only_changes_the_affected_gate(self):
+        image_gate = server.AdaptiveDownloadGate(5)
+        video_gate = server.AdaptiveDownloadGate(10)
+
+        with patch.object(server.random, "uniform", return_value=0):
+            server.register_cdn_throttle(
+                "https://cdn.example/video.mp4", adaptive_gate=video_gate,
+            )
+
+        self.assertEqual(image_gate.current_limit, 5)
+        self.assertEqual(video_gate.current_limit, 5)
 
 
 if __name__ == "__main__":

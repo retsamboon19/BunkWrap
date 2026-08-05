@@ -91,7 +91,7 @@ class AlbumNotFoundError(FileOperationError):
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-VERSION = "5.0.1"
+VERSION = "5.0.2"
 
 DOWNLOADS_DIR = Path("./Downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -122,9 +122,9 @@ ZIP_EXTS   = {".zip", ".rar", ".7z", ".tar", ".gz", ".tar.gz", ".tar.bz2"}
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | ZIP_EXTS
 
 DEFAULT_CONCURRENCY_IMAGES = 5
-DEFAULT_CONCURRENCY_VIDEOS = 2
-MAX_CONCURRENCY_IMAGES = 8
-MAX_CONCURRENCY_VIDEOS = 4
+DEFAULT_CONCURRENCY_VIDEOS = 10
+MAX_CONCURRENCY_IMAGES = 10
+MAX_CONCURRENCY_VIDEOS = 10
 CHUNK_SIZE = 1024 * 512  # 512 KB
 
 BASE_RETRY_DELAY = 2
@@ -153,11 +153,64 @@ bunkrinfo_lock = threading.Lock()
 
 # ─── Global Thread Pools ───────────────────────────────────────────────────────
 # Single resolver pool handles all URL resolutions concurrently.
-# Two semaphores enforce per-type download concurrency independently.
+# Two adaptive gates enforce per-type concurrency independently.
+
+
+class AdaptiveDownloadGate:
+    """Concurrency gate using additive recovery and multiplicative decrease."""
+
+    def __init__(self, limit, recovery_successes=2):
+        self.configured_limit = max(1, int(limit))
+        self.current_limit = self.configured_limit
+        self.active = 0
+        self.success_streak = 0
+        self.recovery_successes = max(1, int(recovery_successes))
+        self._condition = threading.Condition()
+
+    def acquire(self):
+        with self._condition:
+            while self.active >= self.current_limit:
+                self._condition.wait()
+            self.active += 1
+        return True
+
+    def release(self):
+        with self._condition:
+            self.active = max(0, self.active - 1)
+            self._condition.notify_all()
+
+    def record_throttle(self):
+        with self._condition:
+            old_limit = self.current_limit
+            self.current_limit = max(1, self.current_limit // 2)
+            self.success_streak = 0
+            if self.current_limit != old_limit:
+                self._condition.notify_all()
+            return self.current_limit
+
+    def record_success(self):
+        with self._condition:
+            if self.current_limit >= self.configured_limit:
+                self.success_streak = 0
+                return self.current_limit
+            self.success_streak += 1
+            if self.success_streak >= self.recovery_successes:
+                self.current_limit += 1
+                self.success_streak = 0
+                self._condition.notify_all()
+            return self.current_limit
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
 
 global_resolver_pool  = None   # ThreadPoolExecutor(image_threads + video_threads)
-global_image_semaphore = None  # threading.Semaphore(image_threads)
-global_video_semaphore = None  # threading.Semaphore(video_threads)
+global_image_semaphore = None  # AdaptiveDownloadGate(image_threads)
+global_video_semaphore = None  # AdaptiveDownloadGate(video_threads)
 _current_image_threads = 0
 _current_video_threads = 0
 global_pool_lock = threading.Lock()
@@ -209,7 +262,7 @@ def wait_for_cdn_slot(url, job=None, file_index=None):
         time.sleep(delay)
 
 
-def register_cdn_throttle(url, retry_after=None, severe=False):
+def register_cdn_throttle(url, retry_after=None, severe=False, adaptive_gate=None):
     """Apply exponential, shared backoff for 429/503 and broken streams."""
     host = _cdn_host(url)
     if not host:
@@ -222,10 +275,12 @@ def register_cdn_throttle(url, retry_after=None, severe=False):
         delay = max(float(retry_after or 0), calculated) + random.uniform(0.5, 2.0)
         until = time.monotonic() + delay
         _cdn_cooldown_until[host] = max(_cdn_cooldown_until.get(host, 0), until)
+    if adaptive_gate is not None:
+        adaptive_gate.record_throttle()
     return math.ceil(delay)
 
 
-def register_cdn_success(url):
+def register_cdn_success(url, adaptive_gate=None):
     host = _cdn_host(url)
     if not host:
         return
@@ -233,9 +288,11 @@ def register_cdn_success(url):
         strikes = _cdn_rate_strikes.get(host, 0)
         if strikes > 0:
             _cdn_rate_strikes[host] = strikes - 1
+    if adaptive_gate is not None:
+        adaptive_gate.record_success()
 
 # ─── Persistent browser pool ────────────────────────────────────────────────────
-POOL_SIZE = DEFAULT_CONCURRENCY_VIDEOS   # starts equal to video thread count
+POOL_SIZE = 2  # browser resolvers are expensive; independent of download streams
 POOL_MAX  = 15
 
 class BrowserPool:
@@ -1348,7 +1405,7 @@ def generate_video_thumbnail(video_path, album_name):
 
 # ─── Downloader ────────────────────────────────────────────────────────────────
 
-def download_file(url, dest, session, job, file_index, max_retries=None):
+def download_file(url, dest, session, job, file_index, max_retries=None, adaptive_gate=None):
     if max_retries is None:
         max_retries = DEFAULT_MAX_RETRIES
 
@@ -1369,7 +1426,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                 if r.status_code == 429:
                     retry_header = r.headers.get("Retry-After")
                     retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
-                    delay = register_cdn_throttle(url, retry_after, severe=True)
+                    delay = register_cdn_throttle(url, retry_after, severe=True, adaptive_gate=adaptive_gate)
                     rate_limit_events += 1
                     job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rate limit (429); all downloads cooling down for {delay}s..."})
                     if rate_limit_events >= max_rate_limit_events:
@@ -1379,7 +1436,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                 
                 # Handle server errors
                 if r.status_code == 503:
-                    delay = register_cdn_throttle(url, severe=False)
+                    delay = register_cdn_throttle(url, severe=False, adaptive_gate=adaptive_gate)
                     job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN unavailable (503); cooling down for {delay}s..."})
                     attempt += 1
                     continue
@@ -1389,10 +1446,10 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                     match = re.search(r"\*/(\d+)$", content_range)
                     remote_size = int(match.group(1)) if match else preflight_size(url, session)
                     if remote_size and existing_size >= remote_size:
-                        register_cdn_success(url)
+                        register_cdn_success(url, adaptive_gate=adaptive_gate)
                         return True
                     job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rejected the resume offset; keeping the partial file and retrying."})
-                    register_cdn_throttle(url, severe=False)
+                    register_cdn_throttle(url, severe=False, adaptive_gate=adaptive_gate)
                     attempt += 1
                     continue
                 r.raise_for_status()
@@ -1457,7 +1514,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                         f"response ended at {downloaded} of {total_size} bytes"
                     )
                 # Small delay after successful download to reduce rate limiting
-                register_cdn_success(url)
+                register_cdn_success(url, adaptive_gate=adaptive_gate)
                 time.sleep(0.5)
                 return True
 
@@ -1465,7 +1522,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
             if e.response.status_code == 429:
                 retry_header = e.response.headers.get("Retry-After")
                 retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
-                delay = register_cdn_throttle(url, retry_after, severe=True)
+                delay = register_cdn_throttle(url, retry_after, severe=True, adaptive_gate=adaptive_gate)
                 rate_limit_events += 1
                 job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rate limit (429); all downloads cooling down for {delay}s..."})
                 if rate_limit_events >= max_rate_limit_events:
@@ -1473,7 +1530,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                     return False
                 continue
             elif e.response.status_code == 503:
-                delay = register_cdn_throttle(url, severe=False)
+                delay = register_cdn_throttle(url, severe=False, adaptive_gate=adaptive_gate)
                 attempt += 1
                 job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN unavailable (503), retry {attempt}/{max_retries} after {delay}s"})
             else:
@@ -1485,7 +1542,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None):
                 requests.exceptions.ConnectionError,
                 requests.exceptions.ReadTimeout) as e:
             attempt += 1
-            delay = register_cdn_throttle(url, severe=False)
+            delay = register_cdn_throttle(url, severe=False, adaptive_gate=adaptive_gate)
             partial_size = dest.stat().st_size if dest.exists() else 0
             print(f"  [Download] Interrupted attempt {attempt}: {e}")
             job["log"].append({"type": "warn", "msg": f"[{file_index}] Connection interrupted at {format_size(partial_size)}; resume {attempt}/{max_retries} after {delay}s"})
@@ -1736,13 +1793,13 @@ def worker(job_id, task_queue, session, semaphore, worker_idx):
 
 
 def _ensure_global_pools(concurrency_images, concurrency_videos):
-    """Initialize or resize the resolver pool and per-type download semaphores.
+    """Initialize or resize the resolver pool and adaptive download gates.
 
     The resolver pool is sized to image_threads + video_threads so that URL
     resolution always has enough threads to stay ahead of the download queues.
-    Once a file type is known, the worker acquires the appropriate semaphore
-    before starting the download, releasing it when finished.  This gives exact
-    per-type concurrency without nested pool submissions (no deadlock risk).
+    Once a file type is known, the worker acquires the appropriate gate. The
+    gate starts at the user's maximum, halves after throttling/broken streams,
+    and adds slots back gradually after successful transfers.
     """
     global global_resolver_pool, global_image_semaphore, global_video_semaphore
     global _current_image_threads, _current_video_threads
@@ -1766,15 +1823,15 @@ def _ensure_global_pools(concurrency_images, concurrency_videos):
             print(f"  [GlobalPool] Resized resolver pool {old_total} → {total_workers} threads "
                   f"({concurrency_images} image + {concurrency_videos} video/zip)")
 
-        # ── Image semaphore ────────────────────────────────────────────────────
+        # ── Adaptive image gate ───────────────────────────────────────────────
         if global_image_semaphore is None or _current_image_threads != concurrency_images:
-            global_image_semaphore = threading.Semaphore(concurrency_images)
-            print(f"  [GlobalPool] Image semaphore: {concurrency_images} concurrent download(s)")
+            global_image_semaphore = AdaptiveDownloadGate(concurrency_images)
+            print(f"  [GlobalPool] Adaptive image gate: up to {concurrency_images} download(s)")
 
-        # ── Video/zip semaphore ────────────────────────────────────────────────
+        # ── Adaptive video/zip gate ───────────────────────────────────────────
         if global_video_semaphore is None or _current_video_threads != concurrency_videos:
-            global_video_semaphore = threading.Semaphore(concurrency_videos)
-            print(f"  [GlobalPool] Video/zip semaphore: {concurrency_videos} concurrent download(s)")
+            global_video_semaphore = AdaptiveDownloadGate(concurrency_videos)
+            print(f"  [GlobalPool] Adaptive video/zip gate: up to {concurrency_videos} download(s)")
 
         _current_image_threads = concurrency_images
         _current_video_threads = concurrency_videos
@@ -1814,16 +1871,19 @@ def _process_task_with_pool_selection(job_id, task, session):
     ext = get_ext(direct_url) or ".bin"
     file_type = "zip" if ext in ZIP_EXTS else ("image" if ext in IMAGE_EXTS else "video")
 
-    # Acquire the per-type semaphore to enforce independent concurrency limits.
-    # Images use global_image_semaphore; videos and zips use global_video_semaphore.
+    # Acquire the per-type adaptive gate. Images use global_image_semaphore;
+    # videos and zips use global_video_semaphore.
     # Holding a reference at this point is safe: if settings change mid-job the
     # old semaphore is simply released by its holders and the new one takes over.
     sem = global_image_semaphore if file_type == "image" else global_video_semaphore
     with sem:
-        return _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type)
+        return _download_file_task(
+            job_id, idx, page_url, direct_url, out_dir, album_name, total,
+            session, file_type, adaptive_gate=sem,
+        )
 
 
-def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type):
+def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, total, session, file_type, adaptive_gate=None):
     """Download a file after URL has been resolved and type determined."""
     job = jobs[job_id]
     max_retries = job.get("max_retries", DEFAULT_MAX_RETRIES)
@@ -1862,7 +1922,10 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
     with jobs_lock:
         job["file_progress"][str(idx)] = {"downloaded": 0, "total": file_size, "speed": 0}
 
-    ok = download_file(direct_url, dest, session, job, str(idx), max_retries)
+    ok = download_file(
+        direct_url, dest, session, job, str(idx), max_retries,
+        adaptive_gate=adaptive_gate,
+    )
 
     if ok:
         # Auto-extract archives into a named subfolder, then delete the archive
@@ -2052,7 +2115,7 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
             job["log"].append({"type": "warn", "msg": f"⚠ Low disk space: {format_size(free_bytes)} free"})
 
     # Submit all tasks to global thread pools
-    job["log"].append({"type": "info", "msg": f"Using global pools: {concurrency_images} image threads, {concurrency_videos} video/zip threads (shared across all albums)"})
+    job["log"].append({"type": "info", "msg": f"Using adaptive pools: up to {concurrency_images} image and {concurrency_videos} video/zip streams; automatically reduces on throttling"})
     
     futures = []
     for idx, page_url in enumerate(file_pages, 1):
@@ -2196,7 +2259,7 @@ def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
     _ensure_global_pools(concurrency_images, concurrency_videos)
     
     job["log"].append({"type": "info", "msg": f"Retrying {len(failed_tasks)} failed file(s)..."})
-    job["log"].append({"type": "info", "msg": f"Using global pools: {concurrency_images} image threads, {concurrency_videos} video/zip threads (shared across all albums)"})
+    job["log"].append({"type": "info", "msg": f"Using adaptive pools: up to {concurrency_images} image and {concurrency_videos} video/zip streams; automatically reduces on throttling"})
     job["total"] = len(failed_tasks)
 
     # Submit all retry tasks to global thread pools
