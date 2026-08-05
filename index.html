@@ -4087,7 +4087,11 @@ function drawSpeedGraph() {
 function renderLog(entries, job) {
   const out = document.getElementById('logOutput');
   const prevCol = out.querySelector('.log-col-active');
+  const prevFailedCol = out.querySelector('.log-col-failed');
+  const prevScrollTop = prevCol ? prevCol.scrollTop : 0;
+  const prevFailedScrollTop = prevFailedCol ? prevFailedCol.scrollTop : 0;
   const wasAtBottom = !prevCol || (prevCol.scrollHeight - prevCol.scrollTop <= prevCol.clientHeight + 60);
+  const failedWasAtBottom = !prevFailedCol || (prevFailedCol.scrollHeight - prevFailedCol.scrollTop <= prevFailedCol.clientHeight + 60);
 
   const headers = [];
   const files   = {};
@@ -4178,9 +4182,13 @@ function renderLog(entries, job) {
     `<div class="log-col log-col-active">${activeHtml}</div>` +
     `<div class="log-col log-col-failed">${failedHtml}</div>`;
 
-  if (wasAtBottom) {
-    const col = out.querySelector('.log-col-active');
-    if (col) col.scrollTop = col.scrollHeight;
+  const col = out.querySelector('.log-col-active');
+  if (col) {
+    col.scrollTop = wasAtBottom ? col.scrollHeight : prevScrollTop;
+  }
+  const failedCol = out.querySelector('.log-col-failed');
+  if (failedCol) {
+    failedCol.scrollTop = failedWasAtBottom ? failedCol.scrollHeight : prevFailedScrollTop;
   }
 }
 

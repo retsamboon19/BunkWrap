@@ -51,6 +51,7 @@ def make_job():
         "log": [],
         "file_speeds": {},
         "file_progress": {},
+        "file_sizes": {},
         "stop_requested": False,
         "pause_requested": False,
     }
@@ -119,12 +120,14 @@ class DownloadReliabilityTests(unittest.TestCase):
             }, [b"efgh"]),
         ])
 
-        ok = server.download_file(
-            "https://cdn.example/video.mp4", self.dest, session,
-            make_job(), "2", max_retries=2,
-        )
+        with patch.object(server, "register_cdn_throttle") as throttle:
+            ok = server.download_file(
+                "https://cdn.example/video.mp4", self.dest, session,
+                make_job(), "2", max_retries=2,
+            )
 
         self.assertTrue(ok)
+        throttle.assert_not_called()
         self.assertEqual(self.dest.read_bytes(), b"abcdefgh")
         self.assertNotIn("Range", session.request_headers[0])
         self.assertEqual(session.request_headers[1]["Range"], "bytes=4-")
@@ -192,6 +195,55 @@ class DownloadReliabilityTests(unittest.TestCase):
 
 
 class JobSafetyTests(unittest.TestCase):
+    def test_resolver_stops_calling_dead_api_after_three_album_misses(self):
+        state = server._new_resolver_state()
+        session = FakeSession([])
+        with patch.object(server, "resolve_bunkr_api", return_value=None) as api, \
+             patch.object(server, "fetch_page", return_value=None):
+            for index in range(6):
+                result = server.resolve_direct_url(
+                    f"https://bunkr.cr/f/file-{index}", session, [],
+                    max_retries=1, allow_playwright=False,
+                    resolver_state=state,
+                )
+                self.assertIsNone(result)
+        self.assertEqual(api.call_count, server.API_PROBE_LIMIT)
+
+    def test_fresh_file_starts_get_without_preflight_head(self):
+        with tempfile.TemporaryDirectory() as root:
+            out_dir = Path(root)
+            job_id = "fresh001"
+            server.jobs[job_id] = {
+                "log": [], "file_sizes": {}, "file_progress": {},
+                "file_speeds": {}, "files": [], "failed_tasks": [],
+                "success": 0, "failed": 0, "skipped": 0, "done": 0,
+                "zip_folders": [], "max_retries": 2,
+            }
+
+            def download_ok(_url, dest, _session, job, file_index, *_args, **_kwargs):
+                dest.write_bytes(b"image")
+                job["file_sizes"][str(file_index)] = 5
+                return True
+
+            try:
+                with patch.object(server, "preflight_size") as preflight, \
+                     patch.object(server, "download_file", side_effect=download_ok), \
+                     patch.object(server, "queue_thumbnail"):
+                    ok = server._download_file_task(
+                        job_id, 1, "https://bunkr.cr/f/example",
+                        "https://cdn.example/example.jpg", out_dir,
+                        "Example Album", 1, FakeSession([]), "image",
+                    )
+                self.assertTrue(ok)
+                preflight.assert_not_called()
+                self.assertEqual(server.jobs[job_id]["success"], 1)
+            finally:
+                server.jobs.pop(job_id, None)
+
+    def test_new_http_session_keeps_album_cookies_for_worker_requests(self):
+        session = server._new_http_session({"album_token": "kept"})
+        self.assertEqual(session.cookies.get("album_token"), "kept")
+
     def test_same_active_album_reuses_queue_item_instead_of_duplicate_writers(self):
         job_id = "already1"
         server.jobs[job_id] = {
@@ -312,7 +364,7 @@ class JobSafetyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         config = response.get_json()
-        self.assertEqual(config["version"], "5.0.2")
+        self.assertEqual(config["version"], "5.1.0")
         self.assertEqual(config["default_concurrency_videos"], 10)
 
     def test_same_album_directory_is_reused_for_resume(self):

@@ -1,10 +1,15 @@
 # BunkrWrap V5
 
+[![Tests](https://github.com/retsamboon19/BunkWrap/actions/workflows/quality.yml/badge.svg)](https://github.com/retsamboon19/BunkWrap/actions/workflows/quality.yml)
+[![Latest release](https://img.shields.io/github/v/release/retsamboon19/BunkWrap?label=download)](https://github.com/retsamboon19/BunkWrap/releases/latest)
+
 BunkrWrap V5 is a local web app for downloading and organizing Bunkr albums. It includes parallel downloads, previews, automatic image and video thumbnails, archive extraction, download history, and gallery management.
 
-### V5.0.2: smarter 10-thread downloads
+### V5.1.0: faster transfers and durable downloads
 
-Video and ZIP downloads now start with up to **10 workers**. If a CDN begins returning rate-limit errors or broken connections, BunkrWrap temporarily reduces active transfers, waits for the affected host, resumes partial files, and gradually returns to 10 after successful downloads. The 10-worker queue remains available throughout, so users do not need to keep changing the thread setting manually.
+Downloads now keep album cookies across worker sessions, reuse pooled connections, avoid a redundant size request for every new file, and stop probing an unavailable resolver API after the first few album-wide misses. Larger stream chunks reduce disk and Python overhead, while image/video thumbnails are generated in a separate background pool so transfers can immediately continue.
+
+Interrupted files remain in the persistent queue and resume from their existing byte count after pausing, restarting the app, or reopening the browser. Explicit CDN rate limits still coordinate a short host cooldown, while an isolated broken stream retries only that file instead of unnecessarily slowing the entire album.
 
 No downloader can guarantee that a third-party CDN will provide full speed or accept 10 simultaneous transfers. BunkrWrap does not rotate IP addresses or use proxy networks to bypass server limits.
 
@@ -12,9 +17,9 @@ No downloader can guarantee that a third-party CDN will provide full speed or ac
 
 No command line or previous Python installation is required.
 
-1. **[Download BunkrWrap V5](https://github.com/retsamboon19/BunkWrap/archive/refs/heads/main.zip)**.
+1. Open **[BunkrWrap Releases](https://github.com/retsamboon19/BunkWrap/releases/latest)** and download the Windows ZIP under **Assets**.
 2. Open the downloaded ZIP and choose **Extract all**.
-3. Open the extracted `BunkWrap-main` folder.
+3. Open the extracted `BunkrWrap-v5.x.x` folder.
 4. Double-click **`Install BunkrWrap.bat`**.
 5. Wait for **Setup complete**. BunkrWrap will open automatically and a desktop shortcut will be created.
 
@@ -57,7 +62,9 @@ Disabling Smart App Control reduces Windows protection against unknown applicati
 
 ## Updating
 
-Download the newest V5 ZIP, extract it over the existing BunkrWrap folder, and run **`Install BunkrWrap.bat`** again. The installer updates or repairs the dependencies without removing your `Downloads`, `Thumbnails`, or download history.
+Open the [release list](https://github.com/retsamboon19/BunkWrap/releases), choose the version you want, download its Windows ZIP, extract it over the existing BunkrWrap folder, and run **`Install BunkrWrap.bat`** again. The installer updates or repairs dependencies without removing your `Downloads`, `Thumbnails`, persistent queue, or download history.
+
+Every version tag automatically creates a separate GitHub release and attached Windows ZIP, so older versions remain available from the same release list.
 
 ## Manual setup (advanced users)
 

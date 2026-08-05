@@ -30,6 +30,7 @@ from urllib.parse import urlparse, urljoin, unquote, urlunparse, parse_qs, urlen
 from collections import deque
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, Response
 
@@ -101,7 +102,7 @@ class AlbumNotFoundError(FileOperationError):
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-VERSION = "5.0.2"
+VERSION = "5.1.0"
 
 DOWNLOADS_DIR = Path("./Downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -127,6 +128,12 @@ HEADERS = {
     "Referer": "https://bunkr.cr/",
 }
 
+MEDIA_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": HEADERS["Accept-Language"],
+}
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts"}
 ZIP_EXTS   = {".zip", ".rar", ".7z", ".tar", ".gz", ".tar.gz", ".tar.bz2"}
@@ -136,7 +143,7 @@ DEFAULT_CONCURRENCY_IMAGES = 5
 DEFAULT_CONCURRENCY_VIDEOS = 10
 MAX_CONCURRENCY_IMAGES = 10
 MAX_CONCURRENCY_VIDEOS = 10
-CHUNK_SIZE = 1024 * 512  # 512 KB
+CHUNK_SIZE = 1024 * 1024 * 2  # 2 MB: fewer Python/write-lock cycles on large files
 
 BASE_RETRY_DELAY = 2
 DEFAULT_MAX_RETRIES = 6
@@ -345,6 +352,8 @@ _current_image_threads = 0
 _current_video_threads = 0
 global_pool_lock = threading.Lock()
 _session_local = threading.local()
+thumbnail_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ThumbnailPool")
+DEFER_THUMBNAILS = True
 
 # Bunkr's CDN rate limits all files on the same host together.  Coordinate
 # request starts and cooldowns across every worker instead of letting each
@@ -353,15 +362,36 @@ _cdn_lock = threading.Lock()
 _cdn_cooldown_until = {}
 _cdn_next_request_at = {}
 _cdn_rate_strikes = {}
-CDN_REQUEST_START_SPACING = 0.35
+CDN_REQUEST_START_SPACING = 0.15
 CDN_MAX_COOLDOWN = 90
+API_PROBE_LIMIT = 3
 
 
-def _thread_session():
-    session = getattr(_session_local, "session", None)
+def _new_http_session(cookies=None):
+    """Create a keep-alive session with enough cached host pools for Bunkr/CDNs."""
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=4, max_retries=0, pool_block=False)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept-Language": HEADERS["Accept-Language"],
+    })
+    if cookies:
+        session.cookies.update(cookies)
+    return session
+
+
+def _thread_session(job_id="default", cookies=None):
+    """Reuse connections per worker and job without leaking cookies across jobs."""
+    sessions = getattr(_session_local, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _session_local.sessions = sessions
+    session = sessions.get(job_id)
     if session is None:
-        session = requests.Session()
-        _session_local.session = session
+        session = _new_http_session(cookies)
+        sessions[job_id] = session
     return session
 
 
@@ -393,7 +423,7 @@ def wait_for_cdn_slot(url, job=None, file_index=None):
 
 
 def register_cdn_throttle(url, retry_after=None, severe=False, adaptive_gate=None):
-    """Apply exponential, shared backoff for 429/503 and broken streams."""
+    """Apply shared backoff only when the CDN explicitly throttles/unavailable."""
     host = _cdn_host(url)
     if not host:
         return 5
@@ -1193,6 +1223,39 @@ def resolve_bunkr_api(slug, session):
         return None
 
 
+def _new_resolver_state():
+    return {
+        "lock": threading.Lock(),
+        "api_attempts": 0,
+        "api_successes": 0,
+        "api_disabled": False,
+    }
+
+
+def _api_probe_allowed(state):
+    if state is None:
+        return True
+    with state["lock"]:
+        if state["api_disabled"]:
+            return False
+        # Reserve the probe while holding the lock so a full resolver pool
+        # cannot all race through the limit before the first response arrives.
+        if state["api_successes"] == 0 and state["api_attempts"] >= API_PROBE_LIMIT:
+            state["api_disabled"] = True
+            return False
+        state["api_attempts"] += 1
+        return True
+
+
+def _record_api_probe(state, succeeded):
+    if state is None:
+        return
+    with state["lock"]:
+        if succeeded:
+            state["api_successes"] += 1
+            state["api_disabled"] = False
+
+
 def _sign_bunkr_cdn_url(raw_url, sign_url, page_url, session):
     """Add the token/ex parameters required by Bunkr's current CDN."""
     try:
@@ -1314,7 +1377,8 @@ def resolve_bunkr_download_link(html, page_url, session):
         return None
 
 
-def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playwright=True, return_reason=False):
+def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playwright=True,
+                       return_reason=False, resolver_state=None):
     """Resolve a file-page URL to a direct download URL. Handles archives specially.
 
     When allow_playwright is False (e.g. album preview), only static HTML is used — fast and
@@ -1325,8 +1389,9 @@ def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playw
 
     # Try bunkr's native API first — fastest, no browser needed
     slug = unquote(page_url.rstrip("/").split("/")[-1])
-    if slug:
+    if slug and _api_probe_allowed(resolver_state):
         api_result = resolve_bunkr_api(slug, session)
+        _record_api_probe(resolver_state, bool(api_result))
         if api_result:
             job_log.append({"type": "info", "msg": f"  Resolved via API: {slug}"})
             return (api_result, None) if return_reason else api_result
@@ -1404,12 +1469,12 @@ def resolve_direct_url(page_url, session, job_log, max_retries=None, allow_playw
 
 # ─── Pre-flight size check ─────────────────────────────────────────────────────
 
-def preflight_size(url, session):
+def preflight_size(url, session, referer="https://bunkr.cr/"):
     """
     Remote file size: HEAD Content-Length, then GET Range 0-0 + Content-Range total.
     Matches Referer used by downloads so CDNs behave consistently.
     """
-    dl_headers = {**HEADERS, "Referer": "https://bunkr.cr/"}
+    dl_headers = {**MEDIA_HEADERS, "Referer": referer}
     try:
         r = session.head(url, headers=dl_headers, timeout=15, allow_redirects=True)
         cl = r.headers.get("content-length")
@@ -1535,11 +1600,41 @@ def generate_video_thumbnail(video_path, album_name):
 
 # ─── Downloader ────────────────────────────────────────────────────────────────
 
+def queue_thumbnail(job_id, file_path, album_name, file_type, filename):
+    """Generate previews away from transfer workers so downloads keep moving."""
+    if file_type == "video" and not FFMPEG_OK:
+        return
+    if file_type not in {"image", "video"}:
+        return
+
+    def _work():
+        thumb_rel = (
+            generate_image_thumbnail(file_path, album_name)
+            if file_type == "image"
+            else generate_video_thumbnail(file_path, album_name)
+        )
+        job = jobs.get(job_id)
+        if not job:
+            return
+        if thumb_rel:
+            with jobs_lock:
+                for item in reversed(job.get("files", [])):
+                    if item.get("name") == filename and item.get("album") == album_name:
+                        item["thumb"] = thumb_rel
+                        break
+            job["log"].append({"type": "info", "msg": f"Thumbnail ready: {filename}"})
+        elif file_type == "video":
+            job["log"].append({"type": "warn", "msg": f"Video thumbnail generation failed: {filename}"})
+
+    thumbnail_pool.submit(_work)
+
+
 class DownloadPaused(Exception):
     """Internal signal to reopen the same file with a Range request."""
 
 
-def download_file(url, dest, session, job, file_index, max_retries=None, adaptive_gate=None):
+def download_file(url, dest, session, job, file_index, max_retries=None,
+                  adaptive_gate=None, referer="https://bunkr.cr/"):
     if max_retries is None:
         max_retries = DEFAULT_MAX_RETRIES
 
@@ -1551,7 +1646,7 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
         try:
             wait_for_cdn_slot(url, job, file_index)
             existing_size = dest.stat().st_size if dest.exists() else 0
-            dl_headers = {**HEADERS, "Referer": "https://bunkr.cr/"}
+            dl_headers = {**MEDIA_HEADERS, "Referer": referer}
             if existing_size > 0:
                 dl_headers["Range"] = f"bytes={existing_size}-"
 
@@ -1578,8 +1673,10 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                 if r.status_code == 416:
                     content_range = r.headers.get("Content-Range", "")
                     match = re.search(r"\*/(\d+)$", content_range)
-                    remote_size = int(match.group(1)) if match else preflight_size(url, session)
+                    remote_size = int(match.group(1)) if match else preflight_size(url, session, referer)
                     if remote_size and existing_size >= remote_size:
+                        with jobs_lock:
+                            job["file_sizes"][file_index] = remote_size
                         register_cdn_success(url, adaptive_gate=adaptive_gate)
                         return True
                     job["log"].append({"type": "warn", "msg": f"[{file_index}] CDN rejected the resume offset; keeping the partial file and retrying."})
@@ -1605,7 +1702,14 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                     existing_size = 0
 
                 total_from_header = r.headers.get("content-length")
-                total_size = (int(total_from_header) + existing_size) if total_from_header else None
+                content_range = r.headers.get("Content-Range", "")
+                range_total = re.search(r"/(\d+)\s*$", content_range)
+                if range_total:
+                    total_size = int(range_total.group(1))
+                else:
+                    total_size = (int(total_from_header) + existing_size) if total_from_header else None
+                with jobs_lock:
+                    job["file_sizes"][file_index] = total_size
                 speed_window = deque(maxlen=10)
                 downloaded = existing_size
                 mode = "ab" if existing_size > 0 else "wb"
@@ -1649,7 +1753,9 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                     )
                 # Small delay after successful download to reduce rate limiting
                 register_cdn_success(url, adaptive_gate=adaptive_gate)
-                time.sleep(0.5)
+                if total_size is None and dest.exists():
+                    with jobs_lock:
+                        job["file_sizes"][file_index] = dest.stat().st_size
                 return True
 
         except DownloadPaused:
@@ -1688,10 +1794,11 @@ def download_file(url, dest, session, job, file_index, max_retries=None, adaptiv
                 requests.exceptions.ConnectionError,
                 requests.exceptions.ReadTimeout) as e:
             attempt += 1
-            delay = register_cdn_throttle(url, severe=False, adaptive_gate=adaptive_gate)
+            delay = min(8, math.ceil(1.5 * attempt + random.uniform(0.25, 1.25)))
             partial_size = dest.stat().st_size if dest.exists() else 0
             print(f"  [Download] Interrupted attempt {attempt}: {e}")
             job["log"].append({"type": "warn", "msg": f"[{file_index}] Connection interrupted at {format_size(partial_size)}; resume {attempt}/{max_retries} after {delay}s"})
+            time.sleep(delay)
         except Exception as e:
             attempt += 1
             print(f"  [Download] Attempt {attempt} failed: {e}")
@@ -1741,11 +1848,29 @@ def process_task(job_id, task, session, worker_idx):
     dest = out_dir / filename
     file_type = "zip" if ext in ZIP_EXTS else ("image" if ext in IMAGE_EXTS else "video")
 
-    file_size = preflight_size(direct_url, session)
+    # Fresh downloads learn their size from the GET response. Avoiding a HEAD
+    # request here nearly halves CDN request volume for a new album. Existing
+    # files are trusted only when the durable completion map matches this page;
+    # partial/unknown files still get one probe so they can resume safely.
+    file_size = None
+    known_complete = False
+    if dest.exists():
+        with bunkrinfo_lock:
+            completed_source = _bunkrinfo_read(out_dir).get("files", {}).get(filename)
+        known_complete = bool(
+            completed_source
+            and strip_page_param(completed_source).rstrip("/")
+            == strip_page_param(page_url).rstrip("/")
+            and dest.stat().st_size > 0
+        )
+        if known_complete:
+            file_size = dest.stat().st_size
+        else:
+            file_size = preflight_size(direct_url, session, page_url)
     with jobs_lock:
-        job["file_sizes"][idx] = file_size
+        job["file_sizes"][str(idx)] = file_size
 
-    if dest.exists() and file_size and dest.stat().st_size >= file_size:
+    if known_complete or (dest.exists() and file_size and dest.stat().st_size >= file_size):
         job["log"].append({"type": "skip", "msg": f"[{idx}] ↷ Skipped (exists): {filename}"})
         with jobs_lock:
             job["skipped"] += 1
@@ -1866,13 +1991,13 @@ def process_task(job_id, task, session, worker_idx):
                 except Exception:
                     pass
         thumb_rel = None
-        if file_type == "video" and FFMPEG_OK:
+        if not DEFER_THUMBNAILS and file_type == "video" and FFMPEG_OK:
             thumb_rel = generate_video_thumbnail(dest, album_name)
             if thumb_rel:
                 job["log"].append({"type": "info", "msg": f"[{idx}] 🖼 Video thumbnail: {thumb_rel}"})
             else:
                 job["log"].append({"type": "warn", "msg": f"[{idx}] ⚠ Video thumbnail generation failed"})
-        elif file_type == "image":
+        elif not DEFER_THUMBNAILS and file_type == "image":
             thumb_rel = generate_image_thumbnail(dest, album_name)
             if thumb_rel:
                 job["log"].append({"type": "info", "msg": f"[{idx}] 🖼 Image thumbnail: {thumb_rel}"})
@@ -1882,8 +2007,11 @@ def process_task(job_id, task, session, worker_idx):
             _info.setdefault("files", {})[filename] = page_url
             _bunkrinfo_write(out_dir, _info)
         with jobs_lock:
-            job["files"].append({"name": filename, "album": album_name, "type": file_type, "size": file_size, "thumb": thumb_rel})
+            file_size = job["file_sizes"].get(str(idx)) or (dest.stat().st_size if dest.exists() else file_size)
+            job["files"].append({"name": filename, "album": album_name, "type": file_type, "size": file_size, "thumb": None})
             job["success"] += 1
+        if DEFER_THUMBNAILS:
+            queue_thumbnail(job_id, dest, album_name, file_type, filename)
     else:
         job["log"].append({"type": "error", "msg": f"[{idx}] ✗ Download failed: {filename}"})
         with jobs_lock:
@@ -1986,10 +2114,10 @@ def _ensure_global_pools(concurrency_images, concurrency_videos):
 def _process_task_with_pool_selection(job_id, task, session):
     """Process a task by first resolving the URL to determine file type, then downloading directly."""
     idx, page_url, out_dir, album_name, total = task
+    job = jobs[job_id]
     # requests.Session is not guaranteed to be safe when mutated concurrently.
     # Reuse one session per resolver thread instead of sharing a single job session.
-    session = _thread_session()
-    job = jobs[job_id]
+    session = _thread_session(job_id, job.get("_session_cookies"))
     max_retries = job.get("max_retries", DEFAULT_MAX_RETRIES)
     
     # Avoid stale speed from a previous file on this worker
@@ -2000,7 +2128,10 @@ def _process_task_with_pool_selection(job_id, task, session):
     job["log"].append({"type": "info", "msg": f"[{idx}/{total}] Resolving {file_id}..."})
 
     # Resolve URL to determine file type
-    direct_url, fail_reason = resolve_direct_url(page_url, session, job["log"], max_retries, return_reason=True)
+    direct_url, fail_reason = resolve_direct_url(
+        page_url, session, job["log"], max_retries, return_reason=True,
+        resolver_state=job.get("_resolver_state"),
+    )
 
     if not direct_url:
         job["log"].append({"type": "error", "msg": f"[{idx}] ✗ {fail_reason} — skipping"})
@@ -2047,11 +2178,29 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
 
     dest = out_dir / filename
 
-    file_size = preflight_size(direct_url, session)
+    # Fresh downloads learn their size from the GET response. Avoiding a HEAD
+    # request here nearly halves CDN request volume for a new album. Existing
+    # files are trusted only when the durable completion map matches this page;
+    # partial/unknown files still get one probe so they can resume safely.
+    file_size = None
+    known_complete = False
+    if dest.exists():
+        with bunkrinfo_lock:
+            completed_source = _bunkrinfo_read(out_dir).get("files", {}).get(filename)
+        known_complete = bool(
+            completed_source
+            and strip_page_param(completed_source).rstrip("/")
+            == strip_page_param(page_url).rstrip("/")
+            and dest.stat().st_size > 0
+        )
+        if known_complete:
+            file_size = dest.stat().st_size
+        else:
+            file_size = preflight_size(direct_url, session, page_url)
     with jobs_lock:
-        job["file_sizes"][idx] = file_size
+        job["file_sizes"][str(idx)] = file_size
 
-    if dest.exists() and file_size and dest.stat().st_size >= file_size:
+    if known_complete or (dest.exists() and file_size and dest.stat().st_size >= file_size):
         job["log"].append({"type": "skip", "msg": f"[{idx}] ↷ Skipped (exists): {filename}"})
         with jobs_lock:
             job["skipped"] += 1
@@ -2070,7 +2219,7 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
 
     ok = download_file(
         direct_url, dest, session, job, str(idx), max_retries,
-        adaptive_gate=adaptive_gate,
+        adaptive_gate=adaptive_gate, referer=page_url,
     )
 
     if ok:
@@ -2175,13 +2324,13 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
                 except Exception:
                     pass
         thumb_rel = None
-        if file_type == "video" and FFMPEG_OK:
+        if not DEFER_THUMBNAILS and file_type == "video" and FFMPEG_OK:
             thumb_rel = generate_video_thumbnail(dest, album_name)
             if thumb_rel:
                 job["log"].append({"type": "info", "msg": f"[{idx}] 🖼 Video thumbnail: {thumb_rel}"})
             else:
                 job["log"].append({"type": "warn", "msg": f"[{idx}] ⚠ Video thumbnail generation failed"})
-        elif file_type == "image":
+        elif not DEFER_THUMBNAILS and file_type == "image":
             thumb_rel = generate_image_thumbnail(dest, album_name)
             if thumb_rel:
                 job["log"].append({"type": "info", "msg": f"[{idx}] 🖼 Image thumbnail: {thumb_rel}"})
@@ -2191,8 +2340,11 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
             _info.setdefault("files", {})[filename] = page_url
             _bunkrinfo_write(out_dir, _info)
         with jobs_lock:
-            job["files"].append({"name": filename, "album": album_name, "type": file_type, "size": file_size, "thumb": thumb_rel})
+            file_size = job["file_sizes"].get(str(idx)) or (dest.stat().st_size if dest.exists() else file_size)
+            job["files"].append({"name": filename, "album": album_name, "type": file_type, "size": file_size, "thumb": None})
             job["success"] += 1
+        if DEFER_THUMBNAILS:
+            queue_thumbnail(job_id, dest, album_name, file_type, filename)
     else:
         job["log"].append({"type": "error", "msg": f"[{idx}] ✗ Download failed: {filename}"})
         with jobs_lock:
@@ -2214,7 +2366,8 @@ def _download_file_task(job_id, idx, page_url, direct_url, out_dir, album_name, 
 def run_job(job_id, album_url, concurrency_images, concurrency_videos):
     job = jobs[job_id]
     job["_runner_active"] = True
-    session = requests.Session()
+    job["_resolver_state"] = _new_resolver_state()
+    session = _new_http_session()
 
     # Ensure global pools are initialized with current settings
     _ensure_global_pools(concurrency_images, concurrency_videos)
@@ -2228,6 +2381,7 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
         job["log"].append({"type": "warn", "msg": "⚠ 7-Zip not found — .rar and .7z archives will not be extracted."})
 
     album_name, file_pages = extract_file_links(album_url, session, job["log"])
+    job["_session_cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
 
     if not file_pages:
         job["log"].append({"type": "error", "msg": "No files found in album."})
@@ -2423,7 +2577,8 @@ def run_job(job_id, album_url, concurrency_images, concurrency_videos):
 def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
     job = jobs[job_id]
     job["_runner_active"] = True
-    session = requests.Session()
+    job["_resolver_state"] = _new_resolver_state()
+    session = _new_http_session(job.get("_session_cookies"))
     
     # Ensure global pools are initialized with current settings
     _ensure_global_pools(concurrency_images, concurrency_videos)
@@ -2455,13 +2610,6 @@ def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
 
     # Clean up if stopped
     if job.get("stop_requested"):
-        # Drain the queue to prevent it from blocking
-        while not task_q.empty():
-            try:
-                task_q.get(block=False)
-                task_q.task_done()
-            except Exception:
-                break
         job["log"].append({"type": "warn", "msg": f"⏹ Stopped by user — ✓ {job.get('success',0)} downloaded, ✗ {job.get('failed',0)} still failed"})
         job["status"] = "done"
         job["paused"] = False
@@ -2479,18 +2627,19 @@ def run_retry_job(job_id, failed_tasks, concurrency_images, concurrency_videos):
 
 # ─── Preview incremental sizes (background + SSE) ────────────────────────────
 
-def _preview_resolve_size(idx, page_url):
+def _preview_resolve_size(idx, page_url, resolver_state):
     """
     Resolve Bunkr file page → CDN URL, then probe size.
     Tries fast static HTML first; if no URL or no measurable size, uses Playwright (serialized).
     """
-    sess = requests.Session()
+    sess = _new_http_session()
     sz = None
     direct = None
     try:
         plog = []
         direct = resolve_direct_url(
-            page_url, sess, plog, max_retries=2, allow_playwright=False
+            page_url, sess, plog, max_retries=2, allow_playwright=False,
+            resolver_state=resolver_state,
         )
         if direct:
             sz = preflight_size(direct, sess)
@@ -2499,7 +2648,8 @@ def _preview_resolve_size(idx, page_url):
         if need_js:
             plog2 = []
             direct_js = resolve_direct_url(
-                page_url, sess, plog2, max_retries=2, allow_playwright=True
+                page_url, sess, plog2, max_retries=2, allow_playwright=True,
+                resolver_state=resolver_state,
             )
             target = direct_js or direct
             if target:
@@ -2520,9 +2670,10 @@ def _preview_sizes_worker(preview_id, file_pages):
         q = s["queue"]
 
     workers = min(PREVIEW_MAX_WORKERS, max(1, len(file_pages)))
+    resolver_state = _new_resolver_state()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_preview_resolve_size, i, p): i
+            pool.submit(_preview_resolve_size, i, p, resolver_state): i
             for i, p in enumerate(file_pages)
         }
         for fut in as_completed(futures):
@@ -2558,7 +2709,7 @@ def preview_album():
     if not url or "bunkr" not in url:
         return jsonify({"error": "Invalid Bunkr URL"}), 400
     try:
-        session = requests.Session()
+        session = _new_http_session()
         album_name, file_pages = extract_file_links(url, session)
         if not file_pages:
             return jsonify({"error": "No files found in album."}), 404
